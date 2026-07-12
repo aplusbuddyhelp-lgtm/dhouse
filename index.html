@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#0f0e17">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>DHouse</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Add after <title> -->
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+
+    <!-- Firebase CDN -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+    
+<!-- ADD THIS LINE -->
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-analytics-compat.js"></script>
+</head>
+<body>
+    <!-- Network Status Indicator -->
+<div id="networkStatus" style="
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 99999;
+  padding: 8px 16px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+  transition: all 0.3s ease;
+"></div>
+    <div id="app"></div>
+
+    <!-- ===== NEW POST MODAL ===== -->
+    <div id="newPostModal" class="new-post-modal" style="display:none;">
+        <div class="new-post-modal-content">
+            <div class="new-post-modal-header">
+                <span style="font-size:1.2rem;font-weight:600;color:#fffffe;">New Post</span>
+                <button class="close-modal-btn" onclick="closeNewPostModal()">✕</button>
+            </div>
+            <div class="new-post-modal-body">
+                <div style="display:flex;gap:0.8rem;margin-bottom:1rem;">
+                    <div class="avatar" style="width:48px;height:48px;font-size:1.2rem;" id="modalUserAvatar">👤</div>
+                    <textarea id="newPostTextArea" placeholder="What's on your mind?" style="flex:1;background:#0f0e17;border:1px solid #2a2a4e;border-radius:12px;color:#fffffe;padding:0.8rem;font-size:1rem;resize:none;min-height:120px;font-family:inherit;width:100%;"></textarea>
+                </div>
+
+                <div id="imagesPreviewGrid" class="images-preview-grid"></div>
+                <div id="imageCountInfo" class="image-count-info">0 / 7 images selected</div>
+
+                <div id="uploadProgressContainer" class="upload-progress-container" style="display:none;">
+                    <div class="upload-progress-text">
+                        <span>Uploading...</span>
+                        <span id="uploadProgressText">0%</span>
+                    </div>
+                    <div class="upload-progress-bar">
+                        <div class="upload-progress-fill" id="uploadProgressFill" style="width:0%;"></div>
+                        
+                    </div>
+                    <div id="uploadStatusText" style="color:#a7a9be;font-size:0.8rem;text-align:center;margin-top:0.3rem;"></div>
+                </div>
+
+                <div style="display:flex;gap:1rem;margin-bottom:1rem;">
+                    <label class="media-upload-label" style="flex:1;padding:0.8rem;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:12px;color:#a7a9be;font-size:0.9rem;cursor:pointer;text-align:center;">
+                        📎 Add Image
+                        <span style="display:block;font-size:0.7rem;color:#6b7280;">Images: <span id="photoCount">0</span>/7</span>
+                        <input type="file" accept="image/*" multiple onchange="handleMediaUpload(event)" style="display:none;">
+                    </label>
+                </div>
+
+                <div style="margin-top:0.5rem;">
+                    <input type="text" id="tagInput" placeholder="Tag people with @username (e.g., @sarahk)" style="width:100%;padding:0.7rem;background:#0f0e17;border:1px solid #2a2a4e;border-radius:10px;color:#fffffe;font-size:0.9rem;">
+                </div>
+
+                <button id="modalPostBtn" class="post-submit-btn" onclick="submitModalPost()">Post</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== COMMENT BOTTOM SHEET ===== -->
+    <div id="commentSheetOverlay" class="comment-sheet-overlay" onclick="closeCommentSheet()"></div>
+
+    <div id="commentSheet" class="comment-bottom-sheet">
+        <div class="comment-sheet-header">
+            <h3>💬 Comments</h3>
+            <button class="comment-sheet-close" onclick="closeCommentSheet()">✕</button>
+        </div>
+        
+        <div class="comment-sheet-reply-indicator" id="commentReplyIndicator">
+            <span>Replying to <strong id="commentReplyToName"></strong></span>
+            <span class="cancel-reply" onclick="cancelCommentSheetReply()">Cancel</span>
+            <input type="hidden" id="commentReplyToId" value="">
+        </div>
+        
+        <div id="commentSheetBody" class="comment-sheet-body">
+            <div class="comment-sheet-loading">
+                <div class="spinner"></div>
+                <p>Loading comments...</p>
+            </div>
+        </div>
+        
+        <div class="comment-sheet-input-area">
+            <textarea id="commentSheetInput" class="comment-sheet-input" placeholder="Write a comment..." rows="1"></textarea>
+            <button id="commentSheetSubmit" class="comment-sheet-submit" onclick="submitCommentSheet()">Post</button>
+        </div>
+    </div>
+
+    <!-- ===== REPLY VIEW (From Notification) ===== -->
+    <div id="replyViewContainer" style="display:none;"></div>
+
+    <!-- ===== EMOJI PICKER ===== -->
+    <div id="emojiPickerModal" class="emoji-picker-modal" style="display:none;">
+        <div class="emoji-picker-content">
+            <div class="emoji-picker-title">Choose a reaction</div>
+            <div class="emoji-grid" id="emojiPickerGrid"></div>
+            <button class="close-emoji-picker" onclick="closeEmojiPicker()">Cancel</button>
+        </div>
+    </div>
+<!-- ===== CREATE AD MODAL ===== -->
+<div id="createAdModal" class="new-post-modal" style="display:none;">
+    <div class="new-post-modal-content">
+        <div class="new-post-modal-header">
+            <span style="font-size:1.2rem;font-weight:600;color:#fffffe;">📢 Create Ad</span>
+            <button class="close-modal-btn" onclick="closeCreateAdModal()">✕</button>
+        </div>
+        <div class="new-post-modal-body">
+            <div style="margin-bottom:1rem;">
+                <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Business Name *</label>
+                <input type="text" id="adBusinessNameInput" style="width:100%;padding:0.6rem;background:#0f0e17;border:1px solid #2a2a4e;border-radius:10px;color:#fffffe;font-size:0.9rem;" placeholder="Your business name">
+            </div>
+            
+            <div style="margin-bottom:1rem;">
+                <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Budget (₦) *</label>
+                <input type="number" id="adBudgetInput" style="width:100%;padding:0.6rem;background:#0f0e17;border:1px solid #2a2a4e;border-radius:10px;color:#fffffe;font-size:0.9rem;" placeholder="Enter amount" oninput="updateAdImpressionCount()">
+                <div style="background:#0f0e17;border-radius:10px;padding:0.8rem;margin-top:0.5rem;text-align:center;">
+                    <div style="color:#FFB300;font-size:1.5rem;font-weight:bold;" id="adImpressionDisplay">0</div>
+                    <div style="color:#6b7280;font-size:0.7rem;">Estimated Impressions</div>
+                    <div style="color:#6b7280;font-size:0.6rem;">Cost: ₦0.50 per impression</div>
+                </div>
+            </div>
+            
+            <div style="margin-bottom:1rem;">
+                <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Banner Image *</label>
+                <input type="file" id="adImageInput" accept="image/*" style="display:none;" onchange="previewAdImage(event)">
+                <button onclick="document.getElementById('adImageInput').click()" style="width:100%;padding:0.6rem;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:10px;color:#a7a9be;cursor:pointer;font-size:0.9rem;">📷 Select Image</button>
+                <div id="adImagePreviewContainer" style="margin-top:0.5rem;"></div>
+            </div>
+            
+            <button id="submitAdBtn" onclick="submitAdRequest()" style="width:100%;padding:0.8rem;background:#e94560;border:none;border-radius:10px;color:white;font-weight:600;cursor:pointer;font-size:1rem;">💰 Submit Ad</button>
+        </div>
+    </div>
+</div>
+    <script src="app.js"></script>
+</body>
+</html>
