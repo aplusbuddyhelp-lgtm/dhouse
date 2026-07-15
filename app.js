@@ -1862,6 +1862,39 @@ async function loadPostsOptimized() {
     console.error('Error loading predictions:', error);
   }
   
+  // ⬇️ ADD WORD GAME LOADING HERE ⬇️
+  // Load daily words (word games)
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const snapshot = await db.collection('daily_words')
+      .where('date', '>=', today)
+      .orderBy('date', 'asc')
+      .get();
+    
+    currentWordGames = [];
+    for (const doc of snapshot.docs) {
+      const wordData = { id: doc.id, ...doc.data() };
+      if (currentUser) {
+        try {
+          const subSnapshot = await db.collection('word_submissions')
+            .where('wordId', '==', doc.id)
+            .where('userId', '==', currentUser.uid)
+            .get();
+          wordData.userSubmitted = !subSnapshot.empty;
+        } catch (e) {
+          wordData.userSubmitted = false;
+        }
+      } else {
+        wordData.userSubmitted = false;
+      }
+      currentWordGames.push(wordData);
+    }
+    console.log(`🎯 Loaded ${currentWordGames.length} word games`);
+  } catch (error) {
+    console.error('Error loading word games:', error);
+  }
+  // ⬆️ END WORD GAME LOADING ⬆️
+  
   // Load user predictions if logged in
   if (currentUser) {
     try {
@@ -1927,46 +1960,71 @@ async function loadMoreCommunityPosts() {
   if (loadingEl) loadingEl.style.display = 'block';
   
   try {
-    const result = await dataManager.loadMoreCommunityPosts(20);
+    // Get MORE posts from Firestore (skip the ones we have)
+    const currentIds = new Set(communityPosts.map(p => p.id));
     
-    if (result.data && result.data.length > 0) {
-      // Append to communityPosts
-      communityPosts = [...communityPosts, ...result.data];
+    // Fetch posts that we DON'T already have
+    const snapshot = await db.collection('community_posts')
+      .orderBy('createdAt', 'desc')
+      .limit(30) // Fetch 30 to make sure we get new ones
+      .get();
+    
+    const newPosts = [];
+    snapshot.forEach((doc) => {
+      if (!currentIds.has(doc.id)) {
+        const data = doc.data();
+        newPosts.push({
+          id: doc.id,
+          user: data.username || data.user || 'Anonymous',
+          username: data.username || '@user',
+          userId: data.userId || '',
+          time: data.createdAt?.toDate?.()?.toLocaleString() || 'Just now',
+          content: data.content || '',
+          likes: data.likes || 0,
+          comments: data.commentCount || data.comments || 0,
+          commentCount: data.commentCount || data.comments || 0,
+          shares: data.shares || 0,
+          liked: data.liked || false,
+          tags: data.tags || [],
+          images: data.imageUrls || data.images || [],
+          emojiReactions: data.emojiReactions || {},
+          timestamp: data.createdAt || data.timestamp,
+          createdAt: data.createdAt
+        });
+      }
+    });
+    
+    if (newPosts.length > 0) {
+      // Add to existing posts
+      communityPosts = [...communityPosts, ...newPosts];
       
-      // Re-render community tab
+      // Update cache
+      dataManager.setCache('community_posts', communityPosts);
+      
+      // Re-render
       if (activeTab === 'community') {
         renderMainApp();
         restoreScrollPosition();
       }
       
-      showToast(`📥 Loaded ${result.data.length} more posts`, true);
+      showToast(`📥 Loaded ${newPosts.length} more posts`, true);
+    } else {
+      showToast('📭 No more posts to load', true);
     }
     
-    if (!result.hasMore || result.allLoaded) {
-      if (btn) {
-        btn.textContent = '✅ All posts loaded';
-        btn.disabled = true;
-      }
-      hasMorePosts = false;
-    } else {
-      if (btn) {
-        btn.textContent = `📥 Load More Posts`;
-        btn.disabled = false;
-      }
-      hasMorePosts = true;
-    }
   } catch (error) {
     console.error('Error loading more posts:', error);
     showToast('❌ Failed to load more posts', false);
-    if (btn) {
-      btn.textContent = '🔄 Try Again';
-      btn.disabled = false;
-    }
   }
   
   isLoadingMore = false;
+  if (btn) {
+    btn.textContent = '📥 Load More Posts';
+    btn.disabled = false;
+  }
   if (loadingEl) loadingEl.style.display = 'none';
 }
+
 
 async function loadMoreFeedPosts() {
   if (isLoadingMore) return;
@@ -6540,10 +6598,13 @@ function renderCommunity() {
     return renderSearchScreen();
   }
   
+  // 🔀 SHUFFLE POSTS FOR RANDOM ORDER
   let sortedPosts = [...communityPosts];
   
-  if (communitySortMode === 'top') {
-    sortedPosts.sort((a, b) => b.likes - a.likes);
+  // Shuffle the array (Fisher-Yates)
+  for (let i = sortedPosts.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [sortedPosts[i], sortedPosts[j]] = [sortedPosts[j], sortedPosts[i]];
   }
   
   // Only show first batch initially
@@ -6560,7 +6621,7 @@ function renderCommunity() {
           <h2 style="color:#fffffe;font-size:1.2rem;">👥 Community Feed</h2>
           <div style="display:flex;gap:0.5rem;">
             <button onclick="sortCommunity('newest')" style="background:${communitySortMode === 'newest' ? '#e94560' : '#2a2a4e'};border:none;color:white;padding:0.3rem 0.8rem;border-radius:12px;font-size:0.7rem;cursor:pointer;">Newest</button>
-            <button onclick="sortCommunity('top')" style="background:${communitySortMode === 'top' ? '#e94560' : '#2a2a4e'};border:none;color:white;padding:0.3rem 0.8rem;border-radius:12px;font-size:0.7rem;cursor:pointer;">Top</button>
+            <button onclick="sortCommunity('random')" style="background:${communitySortMode === 'random' ? '#e94560' : '#2a2a4e'};border:none;color:white;padding:0.3rem 0.8rem;border-radius:12px;font-size:0.7rem;cursor:pointer;">Random</button>
           </div>
         </div>
         <div style="text-align:center;padding:2rem;color:#6b7280;">
@@ -6620,12 +6681,13 @@ function renderCommunity() {
         <h2 style="color:#fffffe;font-size:1.2rem;">👥 Community Feed</h2>
         <div style="display:flex;gap:0.5rem;">
           <button onclick="sortCommunity('newest')" style="background:${communitySortMode === 'newest' ? '#e94560' : '#2a2a4e'};border:none;color:white;padding:0.3rem 0.8rem;border-radius:12px;font-size:0.7rem;cursor:pointer;">Newest</button>
-          <button onclick="sortCommunity('top')" style="background:${communitySortMode === 'top' ? '#e94560' : '#2a2a4e'};border:none;color:white;padding:0.3rem 0.8rem;border-radius:12px;font-size:0.7rem;cursor:pointer;">Top</button>
+          <button onclick="sortCommunity('random')" style="background:${communitySortMode === 'random' ? '#e94560' : '#2a2a4e'};border:none;color:white;padding:0.3rem 0.8rem;border-radius:12px;font-size:0.7rem;cursor:pointer;">🎲 Random</button>
         </div>
       </div>
       
       <div style="text-align:center;color:#6b7280;font-size:0.8rem;margin-bottom:0.5rem;">
         ${sortedPosts.length} posts in community • ⭐ ${POINTS_PER_INTERACTION} points per interaction
+        ${communitySortMode === 'random' ? ' 🔀 Showing in random order' : ''}
       </div>
       
       <div id="communityPostsContainer">
@@ -6733,6 +6795,15 @@ document.addEventListener('click', function() {
 
 function sortCommunity(mode) {
   communitySortMode = mode;
+  
+  if (mode === 'random') {
+    // Shuffle the posts
+    for (let i = communityPosts.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [communityPosts[i], communityPosts[j]] = [communityPosts[j], communityPosts[i]];
+    }
+  }
+  
   renderMainApp();
   restoreScrollPosition();
 }
@@ -8773,7 +8844,7 @@ function switchTab(tabId) {
   }
   saveScrollPosition();
   activeTab = tabId;
-  renderMainApp();
+  renderMainApp(); // ← This re-renders with the new tab
 }
 
 // ============================================================
