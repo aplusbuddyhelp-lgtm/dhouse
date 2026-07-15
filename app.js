@@ -14,6 +14,10 @@ const firebaseConfig = {
   appId: "1:85518695125:android:04f1db11f25f20ee79005c"
 };
 
+// Initialize Firebase
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
 
 // ============================================================
 // ===== ENVIRONMENT DETECTION =====
@@ -30,15 +34,770 @@ const isDevelopment = window.location.hostname === 'localhost' ||
 console.log(`🏠 DHouse running in ${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'} mode`);
 
 // ============================================================
-// ===== R2 CONFIGURATION =====
+// ===== APP VERSION =====
 // ============================================================
 
+const APP_VERSION = '2.0.0';
+const BUILD_DATE = '2024-07-13';
 
+console.log(`🏠 DHouse v${APP_VERSION} (${BUILD_DATE})`);
 
-// Initialize Firebase
-firebase.initializeApp(firebaseConfig);
-const auth = firebase.auth();
-const db = firebase.firestore();
+// Check if version changed
+const savedVersion = localStorage.getItem('dhouse_app_version');
+if (savedVersion && savedVersion !== APP_VERSION) {
+  console.log('🔄 New version detected, clearing caches...');
+  localStorage.setItem('dhouse_app_version', APP_VERSION);
+  
+  if ('serviceWorker' in navigator) {
+    caches.keys().then((cacheNames) => {
+      cacheNames.forEach((name) => {
+        if (name.startsWith('dhouse-')) {
+          caches.delete(name);
+          console.log('🗑️ Deleted cache:', name);
+        }
+      });
+    });
+  }
+  
+  showToast('🔄 New version loaded!', true);
+} else if (!savedVersion) {
+  localStorage.setItem('dhouse_app_version', APP_VERSION);
+}
+
+// ============================================================
+// ===== FIREBASE PERSISTENCE (OFFLINE SUPPORT) =====
+// ============================================================
+
+let persistenceEnabled = false;
+
+async function enableFirestorePersistence() {
+  try {
+    await db.enablePersistence({
+      synchronizeTabs: true
+    });
+    persistenceEnabled = true;
+    console.log('💾 Firestore persistence enabled (offline support)');
+  } catch (err) {
+    if (err.code === 'failed-precondition') {
+      console.warn('⚠️ Persistence failed: Multiple tabs open');
+    } else if (err.code === 'unimplemented') {
+      console.warn('⚠️ Persistence not supported by browser');
+    } else {
+      console.error('⚠️ Persistence error:', err);
+    }
+  }
+}
+
+// ============================================================
+// ===== DATA MANAGER WITH CACHING =====
+// ============================================================
+
+class DataManager {
+  constructor() {
+    this.cache = {};
+    this.cacheTimestamps = {};
+    this.pendingRequests = {};
+    this.listeners = [];
+    
+    // Cache TTL in milliseconds
+    this.CACHE_TTL = {
+      community_posts: 30000,  // 30 seconds
+      feed_posts: 30000,       // 30 seconds
+      housemates: 60000,       // 60 seconds
+      predictions: 30000,      // 30 seconds
+      notifications: 10000,    // 10 seconds
+      ads: 30000,              // 30 seconds
+      user_predictions: 10000, // 10 seconds
+      user: 60000,             // 60 seconds
+      all_users: 60000,        // 60 seconds
+      config: 300000,          // 5 minutes
+    };
+    
+    // Pagination state
+    this.pagination = {
+      community_posts: {
+        lastDoc: null,
+        hasMore: true,
+        currentPage: 0,
+        pageSize: 20,
+        allLoaded: false,
+      },
+      feed_posts: {
+        lastDoc: null,
+        hasMore: true,
+        currentPage: 0,
+        pageSize: 20,
+        allLoaded: false,
+      }
+    };
+  }
+
+  // ===== CACHE HELPERS =====
+
+  isCacheValid(key) {
+    if (!this.cacheTimestamps[key]) return false;
+    const ttl = this.CACHE_TTL[key] || 30000;
+    return (Date.now() - this.cacheTimestamps[key]) < ttl;
+  }
+
+  getCache(key) {
+    if (this.isCacheValid(key)) {
+      console.log(`📦 Cache hit: ${key}`);
+      return this.cache[key];
+    }
+    console.log(`📦 Cache miss/expired: ${key}`);
+    return null;
+  }
+
+  setCache(key, data) {
+    this.cache[key] = data;
+    this.cacheTimestamps[key] = Date.now();
+    console.log(`💾 Cached: ${key}`);
+  }
+
+  invalidateCache(key) {
+    delete this.cache[key];
+    delete this.cacheTimestamps[key];
+    console.log(`🗑️ Cache invalidated: ${key}`);
+  }
+
+  invalidateAllCache() {
+    this.cache = {};
+    this.cacheTimestamps = {};
+    // Reset pagination
+    for (const key in this.pagination) {
+      this.pagination[key].lastDoc = null;
+      this.pagination[key].hasMore = true;
+      this.pagination[key].currentPage = 0;
+      this.pagination[key].allLoaded = false;
+    }
+    console.log('🗑️ All cache invalidated');
+  }
+
+  // ===== DEDUPE REQUESTS =====
+
+  async dedupeRequest(key, fetchFn) {
+    // If there's already a pending request, wait for it
+    if (this.pendingRequests[key]) {
+      console.log(`⏳ Waiting for pending request: ${key}`);
+      return this.pendingRequests[key];
+    }
+
+    // Create the request
+    const promise = fetchFn();
+    this.pendingRequests[key] = promise;
+
+    try {
+      const result = await promise;
+      return result;
+    } finally {
+      delete this.pendingRequests[key];
+    }
+  }
+
+  // ===== DATA FETCHERS =====
+
+  async getCommunityPosts(forceRefresh = false, pageSize = 20) {
+    const cacheKey = 'community_posts';
+    
+    if (!forceRefresh && this.isCacheValid(cacheKey)) {
+      const cached = this.cache[cacheKey];
+      if (cached && cached.length > 0) {
+        return { data: cached, fromCache: true };
+      }
+    }
+
+    return this.dedupeRequest(cacheKey, async () => {
+      try {
+        let query = db.collection('community_posts')
+          .orderBy('createdAt', 'desc')
+          .limit(pageSize);
+
+        const paginationState = this.pagination.community_posts;
+        
+        if (paginationState.lastDoc) {
+          query = query.startAfter(paginationState.lastDoc);
+        }
+
+        const snapshot = await query.get();
+        const posts = [];
+        
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          posts.push({
+            id: doc.id,
+            user: data.username || data.user || 'Anonymous',
+            username: data.username || '@user',
+            userId: data.userId || '',
+            time: data.createdAt?.toDate?.()?.toLocaleString() || 'Just now',
+            content: data.content || '',
+            likes: data.likes || 0,
+            comments: data.commentCount || data.comments || 0,
+            commentCount: data.commentCount || data.comments || 0,
+            shares: data.shares || 0,
+            liked: data.liked || false,
+            tags: data.tags || [],
+            images: data.imageUrls || data.images || [],
+            emojiReactions: data.emojiReactions || {},
+            timestamp: data.createdAt || data.timestamp,
+            createdAt: data.createdAt
+          });
+        });
+
+        // Update pagination state
+        if (snapshot.docs.length > 0) {
+          paginationState.lastDoc = snapshot.docs[snapshot.docs.length - 1];
+        }
+        paginationState.hasMore = snapshot.docs.length === pageSize;
+        paginationState.currentPage++;
+
+        // Cache the data
+        this.setCache(cacheKey, posts);
+        
+        return { data: posts, fromCache: false, hasMore: paginationState.hasMore };
+      } catch (error) {
+        console.error('Error fetching community posts:', error);
+        // Try to return cached data even if expired
+        if (this.cache[cacheKey]) {
+          console.log('📦 Using stale cache for community posts');
+          return { data: this.cache[cacheKey], fromCache: true, stale: true };
+        }
+        return { data: [], fromCache: false, hasMore: false, error: error.message };
+      }
+    });
+  }
+
+  async getFeedPosts(forceRefresh = false, pageSize = 20) {
+    const cacheKey = 'feed_posts';
+    
+    if (!forceRefresh && this.isCacheValid(cacheKey)) {
+      const cached = this.cache[cacheKey];
+      if (cached && cached.length > 0) {
+        return { data: cached, fromCache: true };
+      }
+    }
+
+    return this.dedupeRequest(cacheKey, async () => {
+      try {
+        let query = db.collection('feed_posts')
+          .orderBy('createdAt', 'desc')
+          .limit(pageSize);
+
+        const paginationState = this.pagination.feed_posts;
+        
+        if (paginationState.lastDoc) {
+          query = query.startAfter(paginationState.lastDoc);
+        }
+
+        const snapshot = await query.get();
+        const posts = [];
+        
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          posts.push({
+            id: doc.id,
+            type: data.type || 'text',
+            content: data.message || data.content || '',
+            message: data.message || '',
+            imageUrls: data.imageUrls || [],
+            pollOptions: data.pollOptions || [],
+            pollVotes: data.pollVotes || {},
+            likes: data.likes || 0,
+            comments: data.commentCount || data.comments || 0,
+            commentCount: data.commentCount || data.comments || 0,
+            reactions: data.reactions || {},
+            liked: data.liked || false,
+            timestamp: data.createdAt || data.timestamp,
+            time: data.createdAt?.toDate?.()?.toLocaleString() || 'Just now',
+            user: data.user || 'DHouse Admin',
+            displayIcons: data.displayIcons || [],
+            reactionIcons: data.reactionIcons || [],
+            votes: data.votes || [],
+            createdAt: data.createdAt,
+            emojiReactions: data.emojiReactions || {}
+          });
+        });
+
+        if (snapshot.docs.length > 0) {
+          paginationState.lastDoc = snapshot.docs[snapshot.docs.length - 1];
+        }
+        paginationState.hasMore = snapshot.docs.length === pageSize;
+        paginationState.currentPage++;
+
+        this.setCache(cacheKey, posts);
+        return { data: posts, fromCache: false, hasMore: paginationState.hasMore };
+      } catch (error) {
+        console.error('Error fetching feed posts:', error);
+        if (this.cache[cacheKey]) {
+          return { data: this.cache[cacheKey], fromCache: true, stale: true };
+        }
+        return { data: [], fromCache: false, hasMore: false, error: error.message };
+      }
+    });
+  }
+
+  async getHousemates(forceRefresh = false) {
+    const cacheKey = 'housemates';
+    
+    if (!forceRefresh && this.isCacheValid(cacheKey)) {
+      const cached = this.cache[cacheKey];
+      if (cached) return { data: cached, fromCache: true };
+    }
+
+    return this.dedupeRequest(cacheKey, async () => {
+      try {
+        const snapshot = await db.collection('housemates')
+          .orderBy('name', 'asc')
+          .get();
+        
+        const housemates = [];
+        snapshot.forEach((doc) => {
+          housemates.push({ id: doc.id, ...doc.data() });
+        });
+
+        this.setCache(cacheKey, housemates);
+        return { data: housemates, fromCache: false };
+      } catch (error) {
+        console.error('Error fetching housemates:', error);
+        if (this.cache[cacheKey]) {
+          return { data: this.cache[cacheKey], fromCache: true, stale: true };
+        }
+        return { data: [], fromCache: false, error: error.message };
+      }
+    });
+  }
+
+  async getPredictions(forceRefresh = false) {
+    const cacheKey = 'predictions';
+    
+    if (!forceRefresh && this.isCacheValid(cacheKey)) {
+      const cached = this.cache[cacheKey];
+      if (cached) return { data: cached, fromCache: true };
+    }
+
+    return this.dedupeRequest(cacheKey, async () => {
+      try {
+        const snapshot = await db.collection('predictions')
+          .orderBy('createdAt', 'desc')
+          .get();
+        
+        const predictions = [];
+        snapshot.forEach((doc) => {
+          predictions.push({ id: doc.id, ...doc.data() });
+        });
+
+        this.setCache(cacheKey, predictions);
+        return { data: predictions, fromCache: false };
+      } catch (error) {
+        console.error('Error fetching predictions:', error);
+        if (this.cache[cacheKey]) {
+          return { data: this.cache[cacheKey], fromCache: true, stale: true };
+        }
+        return { data: [], fromCache: false, error: error.message };
+      }
+    });
+  }
+
+  async getNotifications(userId, forceRefresh = false) {
+    if (!userId) return { data: [], fromCache: false };
+    
+    const cacheKey = `notifications_${userId}`;
+    
+    if (!forceRefresh && this.isCacheValid(cacheKey)) {
+      const cached = this.cache[cacheKey];
+      if (cached) return { data: cached, fromCache: true };
+    }
+
+    return this.dedupeRequest(cacheKey, async () => {
+      try {
+        const snapshot = await db.collection('notifications')
+          .where('to', '==', userId)
+          .orderBy('timestamp', 'desc')
+          .limit(50)
+          .get();
+        
+        const notifications = [];
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          notifications.push({
+            id: doc.id,
+            type: data.type || 'tag',
+            from: data.from || '',
+            to: data.to || '',
+            message: data.message || '',
+            read: data.read || false,
+            time: data.time || 'Just now',
+            timestamp: data.timestamp,
+            fromName: data.fromName || 'Someone',
+            postId: data.postId || '',
+            commentId: data.commentId || '',
+            parentCommentId: data.parentCommentId || '',
+            replyText: data.replyText || ''
+          });
+        });
+
+        this.setCache(cacheKey, notifications);
+        return { data: notifications, fromCache: false };
+      } catch (error) {
+        console.error('Error fetching notifications:', error);
+        if (this.cache[cacheKey]) {
+          return { data: this.cache[cacheKey], fromCache: true, stale: true };
+        }
+        return { data: [], fromCache: false, error: error.message };
+      }
+    });
+  }
+
+  async getAds(forceRefresh = false) {
+    const cacheKey = 'ads';
+    
+    if (!forceRefresh && this.isCacheValid(cacheKey)) {
+      const cached = this.cache[cacheKey];
+      if (cached) return { data: cached, fromCache: true };
+    }
+
+    return this.dedupeRequest(cacheKey, async () => {
+      try {
+        const snapshot = await db.collection('ads')
+          .where('status', '==', 'approved')
+          .get();
+        
+        const ads = [];
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          if ((data.budgetLeft || 0) <= 0) return;
+          ads.push({ id: doc.id, ...data });
+        });
+
+        this.setCache(cacheKey, ads);
+        return { data: ads, fromCache: false };
+      } catch (error) {
+        console.error('Error fetching ads:', error);
+        if (this.cache[cacheKey]) {
+          return { data: this.cache[cacheKey], fromCache: true, stale: true };
+        }
+        return { data: [], fromCache: false, error: error.message };
+      }
+    });
+  }
+
+  async getUserPredictions(userId, forceRefresh = false) {
+    if (!userId) return { data: {}, fromCache: false };
+    
+    const cacheKey = `user_predictions_${userId}`;
+    
+    if (!forceRefresh && this.isCacheValid(cacheKey)) {
+      const cached = this.cache[cacheKey];
+      if (cached) return { data: cached, fromCache: true };
+    }
+
+    return this.dedupeRequest(cacheKey, async () => {
+      try {
+        const snapshot = await db.collection('user_predictions')
+          .where('userId', '==', userId)
+          .get();
+        
+        const userPredictions = {};
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          userPredictions[data.predictionId] = {
+            id: doc.id,
+            ...data
+          };
+        });
+
+        this.setCache(cacheKey, userPredictions);
+        return { data: userPredictions, fromCache: false };
+      } catch (error) {
+        console.error('Error fetching user predictions:', error);
+        if (this.cache[cacheKey]) {
+          return { data: this.cache[cacheKey], fromCache: true, stale: true };
+        }
+        return { data: {}, fromCache: false, error: error.message };
+      }
+    });
+  }
+
+  async getAllUsers(forceRefresh = false) {
+    const cacheKey = 'all_users';
+    
+    if (!forceRefresh && this.isCacheValid(cacheKey)) {
+      const cached = this.cache[cacheKey];
+      if (cached) return { data: cached, fromCache: true };
+    }
+
+    return this.dedupeRequest(cacheKey, async () => {
+      try {
+        const snapshot = await db.collection('users').get();
+        const users = [];
+        snapshot.forEach((doc) => {
+          users.push({ id: doc.id, ...doc.data() });
+        });
+
+        this.setCache(cacheKey, users);
+        return { data: users, fromCache: false };
+      } catch (error) {
+        console.error('Error fetching users:', error);
+        if (this.cache[cacheKey]) {
+          return { data: this.cache[cacheKey], fromCache: true, stale: true };
+        }
+        return { data: [], fromCache: false, error: error.message };
+      }
+    });
+  }
+
+  // ===== LOAD MORE FUNCTIONS =====
+
+  async loadMoreCommunityPosts(pageSize = 20) {
+    const paginationState = this.pagination.community_posts;
+    
+    if (!paginationState.hasMore || paginationState.allLoaded) {
+      return { data: [], hasMore: false, allLoaded: true };
+    }
+
+    return this.dedupeRequest('community_posts_more', async () => {
+      try {
+        let query = db.collection('community_posts')
+          .orderBy('createdAt', 'desc')
+          .limit(pageSize);
+
+        if (paginationState.lastDoc) {
+          query = query.startAfter(paginationState.lastDoc);
+        }
+
+        const snapshot = await query.get();
+        const posts = [];
+        
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          posts.push({
+            id: doc.id,
+            user: data.username || data.user || 'Anonymous',
+            username: data.username || '@user',
+            userId: data.userId || '',
+            time: data.createdAt?.toDate?.()?.toLocaleString() || 'Just now',
+            content: data.content || '',
+            likes: data.likes || 0,
+            comments: data.commentCount || data.comments || 0,
+            commentCount: data.commentCount || data.comments || 0,
+            shares: data.shares || 0,
+            liked: data.liked || false,
+            tags: data.tags || [],
+            images: data.imageUrls || data.images || [],
+            emojiReactions: data.emojiReactions || {},
+            timestamp: data.createdAt || data.timestamp,
+            createdAt: data.createdAt
+          });
+        });
+
+        if (snapshot.docs.length > 0) {
+          paginationState.lastDoc = snapshot.docs[snapshot.docs.length - 1];
+        }
+        paginationState.hasMore = snapshot.docs.length === pageSize;
+        paginationState.currentPage++;
+
+        if (!paginationState.hasMore) {
+          paginationState.allLoaded = true;
+        }
+
+        // Update cache with new data
+        const existingCache = this.cache['community_posts'] || [];
+        const mergedData = [...existingCache, ...posts];
+        this.setCache('community_posts', mergedData);
+
+        return { 
+          data: posts, 
+          hasMore: paginationState.hasMore,
+          allLoaded: paginationState.allLoaded,
+          fromCache: false 
+        };
+      } catch (error) {
+        console.error('Error loading more community posts:', error);
+        return { data: [], hasMore: false, allLoaded: true, error: error.message };
+      }
+    });
+  }
+
+  async loadMoreFeedPosts(pageSize = 20) {
+    const paginationState = this.pagination.feed_posts;
+    
+    if (!paginationState.hasMore || paginationState.allLoaded) {
+      return { data: [], hasMore: false, allLoaded: true };
+    }
+
+    return this.dedupeRequest('feed_posts_more', async () => {
+      try {
+        let query = db.collection('feed_posts')
+          .orderBy('createdAt', 'desc')
+          .limit(pageSize);
+
+        if (paginationState.lastDoc) {
+          query = query.startAfter(paginationState.lastDoc);
+        }
+
+        const snapshot = await query.get();
+        const posts = [];
+        
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          posts.push({
+            id: doc.id,
+            type: data.type || 'text',
+            content: data.message || data.content || '',
+            message: data.message || '',
+            imageUrls: data.imageUrls || [],
+            pollOptions: data.pollOptions || [],
+            pollVotes: data.pollVotes || {},
+            likes: data.likes || 0,
+            comments: data.commentCount || data.comments || 0,
+            commentCount: data.commentCount || data.comments || 0,
+            reactions: data.reactions || {},
+            liked: data.liked || false,
+            timestamp: data.createdAt || data.timestamp,
+            time: data.createdAt?.toDate?.()?.toLocaleString() || 'Just now',
+            user: data.user || 'DHouse Admin',
+            displayIcons: data.displayIcons || [],
+            reactionIcons: data.reactionIcons || [],
+            votes: data.votes || [],
+            createdAt: data.createdAt,
+            emojiReactions: data.emojiReactions || {}
+          });
+        });
+
+        if (snapshot.docs.length > 0) {
+          paginationState.lastDoc = snapshot.docs[snapshot.docs.length - 1];
+        }
+        paginationState.hasMore = snapshot.docs.length === pageSize;
+        paginationState.currentPage++;
+
+        if (!paginationState.hasMore) {
+          paginationState.allLoaded = true;
+        }
+
+        const existingCache = this.cache['feed_posts'] || [];
+        const mergedData = [...existingCache, ...posts];
+        this.setCache('feed_posts', mergedData);
+
+        return { 
+          data: posts, 
+          hasMore: paginationState.hasMore,
+          allLoaded: paginationState.allLoaded,
+          fromCache: false 
+        };
+      } catch (error) {
+        console.error('Error loading more feed posts:', error);
+        return { data: [], hasMore: false, allLoaded: true, error: error.message };
+      }
+    });
+  }
+
+  // ===== RESET PAGINATION =====
+
+  resetPagination(key) {
+    if (this.pagination[key]) {
+      this.pagination[key].lastDoc = null;
+      this.pagination[key].hasMore = true;
+      this.pagination[key].currentPage = 0;
+      this.pagination[key].allLoaded = false;
+    }
+    this.invalidateCache(key);
+  }
+
+  // ===== REAL-TIME LISTENERS =====
+
+  setupRealTimeListeners(userId) {
+    // Clean up old listeners
+    this.cleanupListeners();
+
+    // Only set up listeners for notifications and user predictions
+    if (userId) {
+      // Notifications listener
+      const notifUnsubscribe = db.collection('notifications')
+        .where('to', '==', userId)
+        .onSnapshot((snapshot) => {
+          const notifications = [];
+          snapshot.forEach((doc) => {
+            const data = doc.data();
+            notifications.push({
+              id: doc.id,
+              type: data.type || 'tag',
+              from: data.from || '',
+              to: data.to || '',
+              message: data.message || '',
+              read: data.read || false,
+              time: data.time || 'Just now',
+              timestamp: data.timestamp,
+              fromName: data.fromName || 'Someone',
+              postId: data.postId || '',
+              commentId: data.commentId || '',
+              parentCommentId: data.parentCommentId || '',
+              replyText: data.replyText || ''
+            });
+          });
+          
+          // Update cache
+          this.setCache(`notifications_${userId}`, notifications);
+          
+          // Update global state
+          window.notifications = notifications;
+          window.notificationCount = notifications.filter(n => !n.read).length;
+          
+          // Re-render if on notifications tab
+          if (window.activeTab === 'notifications' && !window.isAdmin) {
+            window.renderMainApp();
+          }
+          if (window.isAdmin) {
+            window.renderAdminApp();
+          }
+        }, (error) => {
+          console.error('Notifications listener error:', error);
+        });
+      
+      this.listeners.push(notifUnsubscribe);
+
+      // User predictions listener
+      const predUnsubscribe = db.collection('user_predictions')
+        .where('userId', '==', userId)
+        .onSnapshot((snapshot) => {
+          const userPredictions = {};
+          snapshot.forEach((doc) => {
+            const data = doc.data();
+            userPredictions[data.predictionId] = {
+              id: doc.id,
+              ...data
+            };
+          });
+          
+          this.setCache(`user_predictions_${userId}`, userPredictions);
+          window.userPredictions = userPredictions;
+          
+          if (window.activeTab === 'predictions' && !window.isAdmin) {
+            window.renderMainApp();
+          }
+        }, (error) => {
+          console.error('User predictions listener error:', error);
+        });
+      
+      this.listeners.push(predUnsubscribe);
+    }
+
+    console.log(`📡 Real-time listeners set up (${this.listeners.length} active)`);
+  }
+
+  cleanupListeners() {
+    this.listeners.forEach(unsubscribe => {
+      try { unsubscribe(); } catch (e) {}
+    });
+    this.listeners = [];
+    console.log('📡 Cleaned up real-time listeners');
+  }
+}
+
+// ============================================================
+// ===== INITIALIZE DATA MANAGER =====
+// ============================================================
+
+const dataManager = new DataManager();
 
 // ============================================================
 // ===== ANALYTICS INITIALIZATION =====
@@ -48,18 +807,70 @@ let analytics = null;
 
 try {
   analytics = firebase.analytics();
-  
-  if (analytics) {
-    if (isDevelopment) {
-      // analytics.setAnalyticsCollectionEnabled(false);
-      console.log('📊 Analytics running in development mode');
-    } else {
-      console.log('📊 Analytics enabled for production');
-    }
+  if (analytics && isDevelopment) {
+    // analytics.setAnalyticsCollectionEnabled(false);
+    console.log('📊 Analytics running in development mode');
+  } else if (analytics) {
+    console.log('📊 Analytics enabled for production');
   }
 } catch (error) {
   console.warn('⚠️ Analytics initialization failed:', error);
 }
+
+// ============================================================
+// ===== SENTRY INITIALIZATION =====
+// ============================================================
+
+const SENTRY_DSN = 'https://caffaaa8422dcf12bcde271a9153ea2e@o4511719229292544.ingest.de.sentry.io/4511722814701648';
+
+if (typeof Sentry !== 'undefined') {
+  Sentry.init({
+    dsn: SENTRY_DSN,
+    environment: isProduction ? 'production' : 'development',
+    release: '2.0.0',
+    tracesSampleRate: 0.1,
+    // Remove BrowserTracing and Replay if they're not in your bundle
+    // Or use a different CDN URL that includes them
+  });
+  
+  console.log('📊 Sentry initialized for error tracking');
+} else {
+  console.warn('⚠️ Sentry SDK not loaded');
+}
+// ============================================================
+// ===== GLOBAL ERROR HANDLING =====
+// ============================================================
+
+window.addEventListener('unhandledrejection', function(event) {
+  if (typeof Sentry !== 'undefined') {
+    Sentry.captureException(event.reason, {
+      tags: {
+        type: 'unhandledRejection',
+      },
+      extra: {
+        promise: event.promise,
+        reason: event.reason,
+      },
+    });
+  }
+  console.error('🔴 Unhandled Rejection:', event.reason);
+});
+
+window.addEventListener('error', function(event) {
+  if (typeof Sentry !== 'undefined') {
+    Sentry.captureException(event.error || event.message, {
+      tags: {
+        type: 'uncaughtError',
+      },
+      extra: {
+        filename: event.filename,
+        lineno: event.lineno,
+        colno: event.colno,
+      },
+    });
+  }
+  console.error('🔴 Uncaught Error:', event.message);
+});
 
 // ============================================================
 // ===== ANALYTICS HELPER FUNCTIONS =====
@@ -89,10 +900,6 @@ function setUserProperties(properties) {
     console.warn('Analytics error:', error);
   }
 }
-
-// ============================================================
-// ===== SCREEN TRACKING =====
-// ============================================================
 
 function logScreenView(screenName, screenClass = '') {
   logEvent('screen_view', {
@@ -379,9 +1186,9 @@ function createControlledFetchSignal(timeout, callerSignal) {
 async function uploadToR2(file, folder = 'uploads', options = {}) {
   const {
     maxRetries = 3,
-    timeoutMs = null,
-    onRetry = null,
-    signal = null,
+      timeoutMs = null,
+      onRetry = null,
+      signal = null,
   } = options;
   
   if (!file) throw new Error('No file provided');
@@ -524,9 +1331,29 @@ async function uploadToR2(file, folder = 'uploads', options = {}) {
       
       if (attempt === maxRetries || (isValidationErr && !isAuthErr)) {
         const msg = isAuthErr ? 'Authentication error. Please sign in again.' :
-                    isNetError ? 'Network error. Please check your connection.' :
-                    isRateLimit ? 'Too many uploads. Please wait.' :
-                    error.message || 'Upload failed';
+          isNetError ? 'Network error. Please check your connection.' :
+          isRateLimit ? 'Too many uploads. Please wait.' :
+          error.message || 'Upload failed';
+        
+        if (typeof Sentry !== 'undefined') {
+          Sentry.captureException(error, {
+            tags: {
+              folder: folder,
+              fileSize: file?.size,
+              fileType: file?.type,
+              isRetry: attempt > 0,
+              maxRetries: maxRetries,
+              errorType: isNetError ? 'network' : isAuthErr ? 'auth' : isRateLimit ? 'rate_limit' : 'unknown',
+            },
+            extra: {
+              filename: file?.name,
+              attempt: attempt,
+              maxRetries: maxRetries,
+              errorMessage: error.message,
+            },
+          });
+        }
+        
         throw new Error(msg);
       }
       
@@ -644,6 +1471,28 @@ async function uploadProfileImage(file, options = {}) {
   return await uploadToR2(file, 'avatars', options);
 }
 
+// ============================================================
+// ===== FIRESTORE ERROR HELPER =====
+// ============================================================
+
+function captureFirestoreError(error, operation, data = {}) {
+  console.error(`❌ Firestore ${operation} error:`, error);
+  
+  if (typeof Sentry !== 'undefined') {
+    Sentry.captureException(error, {
+      tags: {
+        operation: operation,
+        errorCode: error.code || 'unknown',
+      },
+      extra: {
+        ...data,
+        errorMessage: error.message,
+        errorDetails: error.customData || {},
+      },
+    });
+  }
+}
+
 async function uploadAdImage(file, options = {}) {
   return await uploadToR2(file, 'ads', options);
 }
@@ -658,17 +1507,12 @@ async function uploadHousemateImage(file, options = {}) {
 
 function getOptimizedImageUrl(url, width = 800) {
   if (!url) return '';
-  
-  // If it's already a full URL, return it
   if (url.startsWith('http://') || url.startsWith('https://')) {
     return url;
   }
-  
-  // If it's a relative path, prepend the base
   if (url.startsWith('/')) {
     return `${R2_IMAGE_BASE}${url}`;
   }
-  
   return url;
 }
 
@@ -933,200 +1777,11 @@ let settingsData = {
   imageQuality: localStorage.getItem('dhouse_image_quality') || 'medium'
 };
 
-// ============================================================
-// ===== LAZY LOADING & INFINITE SCROLLING =====
-// ============================================================
-
-let postBatchSize = 15;
-let isLoadingMore = false;
-let hasMorePosts = true;
-let lastVisibleDoc = null;
-let postObserver = null;
-
-// ============================================================
-// ===== INTERSECTION OBSERVER FOR LAZY LOADING =====
-// ============================================================
-
-function setupLazyLoading() {
-  if (postObserver) {
-    postObserver.disconnect();
-  }
-  
-  const options = {
-    root: document.getElementById('contentArea'),
-    rootMargin: '100px 0px',
-    threshold: 0.01
-  };
-  
-  postObserver = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        const img = entry.target;
-        const dataSrc = img.getAttribute('data-src');
-        if (dataSrc) {
-          // Set src and add loaded class immediately
-          img.src = dataSrc;
-          img.removeAttribute('data-src');
-          // Force add loaded class
-          img.classList.add('loaded');
-        }
-        postObserver.unobserve(img);
-      }
-    });
-  }, options);
-  
-  // Observe all images with data-src
-  document.querySelectorAll('img[data-src]').forEach(img => {
-    postObserver.observe(img);
-  });
-  
-  // Force load visible images immediately
-  setTimeout(() => {
-    document.querySelectorAll('img[data-src]').forEach(img => {
-      const rect = img.getBoundingClientRect();
-      const contentArea = document.getElementById('contentArea');
-      if (contentArea) {
-        const contentRect = contentArea.getBoundingClientRect();
-        if (rect.top < contentRect.bottom && rect.bottom > contentRect.top) {
-          const dataSrc = img.getAttribute('data-src');
-          if (dataSrc) {
-            img.src = dataSrc;
-            img.removeAttribute('data-src');
-            img.classList.add('loaded');
-          }
-          postObserver.unobserve(img);
-        }
-      }
-    });
-  }, 50);
-}
-
-// ============================================================
-// ===== INFINITE SCROLLING =====
-// ============================================================
-
-function setupInfiniteScroll(containerId) {
-  const container = document.getElementById(containerId);
-  if (!container) return;
-  
-  const options = {
-    root: container,
-    rootMargin: '200px 0px',
-    threshold: 0.1
-  };
-  
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting && !isLoadingMore && hasMorePosts) {
-        loadMorePosts();
-      }
-    });
-  }, options);
-  
-  const sentinel = document.getElementById('scrollSentinel');
-  if (sentinel) {
-    observer.observe(sentinel);
-  }
-  
-  return observer;
-}
-
-async function loadMorePosts() {
-  if (isLoadingMore || !hasMorePosts) return;
-  
-  isLoadingMore = true;
-  const loadingEl = document.getElementById('loadingMore');
-  if (loadingEl) loadingEl.style.display = 'block';
-  
-  try {
-    let query = db.collection('community_posts')
-      .orderBy('createdAt', 'desc')
-      .limit(postBatchSize);
-    
-    if (lastVisibleDoc) {
-      query = query.startAfter(lastVisibleDoc);
-    }
-    
-    const snapshot = await query.get();
-    
-    if (snapshot.empty) {
-      hasMorePosts = false;
-      const endEl = document.getElementById('endOfPosts');
-      if (endEl) endEl.style.display = 'block';
-    } else {
-      lastVisibleDoc = snapshot.docs[snapshot.docs.length - 1];
-      
-      const newPosts = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        newPosts.push({
-          id: doc.id,
-          user: data.username || data.user || 'Anonymous',
-          username: data.username || '@user',
-          userId: data.userId || '',
-          time: data.createdAt?.toDate?.()?.toLocaleString() || 'Just now',
-          content: data.content || '',
-          likes: data.likes || 0,
-          comments: data.commentCount || data.comments || 0,
-          commentCount: data.commentCount || data.comments || 0,
-          shares: data.shares || 0,
-          liked: data.liked || false,
-          tags: data.tags || [],
-          images: data.imageUrls || data.images || [],
-          emojiReactions: data.emojiReactions || {},
-          timestamp: data.createdAt || data.timestamp,
-          createdAt: data.createdAt
-        });
-      });
-      
-      // Append to communityPosts
-      communityPosts = [...communityPosts, ...newPosts];
-      
-      // Re-render only the container
-      if (activeTab === 'community') {
-        appendCommunityPosts(newPosts);
-      }
-    }
-  } catch (error) {
-    console.error('Error loading more posts:', error);
-  }
-  
-  isLoadingMore = false;
-  
-  if (loadingEl) loadingEl.style.display = 'none';
-}
-
-function appendCommunityPosts(posts) {
-  const container = document.getElementById('communityPostsContainer');
-  if (!container) return;
-  
-  // Remove sentinel temporarily
-  const sentinel = document.getElementById('scrollSentinel');
-  if (sentinel) sentinel.remove();
-  
-  let html = '';
-  posts.forEach(post => {
-    html += renderSingleCommunityPost(post);
-  });
-  
-  // Insert before sentinel or at the end
-  if (sentinel) {
-    sentinel.insertAdjacentHTML('beforebegin', html);
-    container.appendChild(sentinel);
-  } else {
-    container.insertAdjacentHTML('beforeend', html);
-  }
-  
-  // Lazy load new images
-  setTimeout(setupLazyLoading, 100);
-}
 
 // ============================================================
 // ===== DOM REFS =====
 // ============================================================
 const root = document.getElementById('app');
-
-console.log('🏠 DHouse app started!');
 
 // ============================================================
 // ===== GETTER FUNCTIONS =====
@@ -1142,6 +1797,253 @@ function getPostById(id) {
 
 function getNotificationById(id) {
   return notifications.find(n => n.id === id);
+}
+
+
+
+// ============================================================
+// ===== LAZY LOADING & INFINITE SCROLLING =====
+// ============================================================
+
+let postBatchSize = 15;
+let isLoadingMore = false;
+let hasMorePosts = true;
+let lastVisibleDoc = null;
+let postObserver = null;
+
+// ============================================================
+// ===== OPTIMIZED DATA LOADER =====
+// ============================================================
+
+let isFirstLoad = true;
+
+async function loadPostsOptimized() {
+  console.log('📊 Loading posts (optimized)...');
+  
+  // Enable persistence first
+  if (!persistenceEnabled) {
+    await enableFirestorePersistence();
+  }
+  
+  // Load community posts
+  try {
+    const result = await dataManager.getCommunityPosts(isFirstLoad);
+    communityPosts = result.data;
+    isDataLoaded = true;
+    console.log(`📊 Loaded ${communityPosts.length} community posts (${result.fromCache ? 'cache' : 'fresh'})`);
+  } catch (error) {
+    console.error('Error loading community posts:', error);
+  }
+  
+  // Load feed posts
+  try {
+    const result = await dataManager.getFeedPosts(isFirstLoad);
+    feedPosts = result.data;
+    console.log(`📊 Loaded ${feedPosts.length} feed posts (${result.fromCache ? 'cache' : 'fresh'})`);
+  } catch (error) {
+    console.error('Error loading feed posts:', error);
+  }
+  
+  // Load housemates
+  try {
+    const result = await dataManager.getHousemates(isFirstLoad);
+    housemates = result.data;
+    console.log(`🏠 Loaded ${housemates.length} housemates (${result.fromCache ? 'cache' : 'fresh'})`);
+  } catch (error) {
+    console.error('Error loading housemates:', error);
+  }
+  
+  // Load predictions
+  try {
+    const result = await dataManager.getPredictions(isFirstLoad);
+    predictions = result.data;
+    console.log(`🔮 Loaded ${predictions.length} predictions (${result.fromCache ? 'cache' : 'fresh'})`);
+  } catch (error) {
+    console.error('Error loading predictions:', error);
+  }
+  
+  // Load user predictions if logged in
+  if (currentUser) {
+    try {
+      const result = await dataManager.getUserPredictions(currentUser.uid, isFirstLoad);
+      userPredictions = result.data;
+      console.log(`🎯 Loaded ${Object.keys(userPredictions).length} user predictions (${result.fromCache ? 'cache' : 'fresh'})`);
+    } catch (error) {
+      console.error('Error loading user predictions:', error);
+    }
+  }
+  
+  // Load ads
+  try {
+    const result = await dataManager.getAds(isFirstLoad);
+    approvedAds = result.data;
+    console.log(`📢 Loaded ${approvedAds.length} ads (${result.fromCache ? 'cache' : 'fresh'})`);
+  } catch (error) {
+    console.error('Error loading ads:', error);
+  }
+  
+  // Load notifications if logged in
+  if (currentUser) {
+    try {
+      const result = await dataManager.getNotifications(currentUser.uid, isFirstLoad);
+      notifications = result.data || [];
+      notificationCount = notifications.filter(n => !n.read).length;
+      console.log(`🔔 Loaded ${notifications.length} notifications (${result.fromCache ? 'cache' : 'fresh'})`);
+    } catch (error) {
+      console.error('Error loading notifications:', error);
+    }
+  }
+  
+  // Setup real-time listeners
+  if (currentUser) {
+    dataManager.setupRealTimeListeners(currentUser.uid);
+  }
+  
+  isFirstLoad = false;
+  
+  // Re-render
+  if (!isAdmin) {
+    renderMainApp();
+  } else {
+    renderAdminApp();
+  }
+}
+
+// ============================================================
+// ===== LOAD MORE FUNCTIONS =====
+// ============================================================
+
+async function loadMoreCommunityPosts() {
+  if (isLoadingMore) return;
+  isLoadingMore = true;
+  
+  const btn = document.getElementById('loadMoreCommunityBtn');
+  const loadingEl = document.getElementById('loadingMoreCommunity');
+  
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '⏳ Loading...';
+  }
+  if (loadingEl) loadingEl.style.display = 'block';
+  
+  try {
+    const result = await dataManager.loadMoreCommunityPosts(20);
+    
+    if (result.data && result.data.length > 0) {
+      // Append to communityPosts
+      communityPosts = [...communityPosts, ...result.data];
+      
+      // Re-render community tab
+      if (activeTab === 'community') {
+        renderMainApp();
+        restoreScrollPosition();
+      }
+      
+      showToast(`📥 Loaded ${result.data.length} more posts`, true);
+    }
+    
+    if (!result.hasMore || result.allLoaded) {
+      if (btn) {
+        btn.textContent = '✅ All posts loaded';
+        btn.disabled = true;
+      }
+      hasMorePosts = false;
+    } else {
+      if (btn) {
+        btn.textContent = `📥 Load More Posts`;
+        btn.disabled = false;
+      }
+      hasMorePosts = true;
+    }
+  } catch (error) {
+    console.error('Error loading more posts:', error);
+    showToast('❌ Failed to load more posts', false);
+    if (btn) {
+      btn.textContent = '🔄 Try Again';
+      btn.disabled = false;
+    }
+  }
+  
+  isLoadingMore = false;
+  if (loadingEl) loadingEl.style.display = 'none';
+}
+
+async function loadMoreFeedPosts() {
+  if (isLoadingMore) return;
+  isLoadingMore = true;
+  
+  const btn = document.getElementById('loadMoreFeedBtn');
+  const loadingEl = document.getElementById('loadingMoreFeed');
+  
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '⏳ Loading...';
+  }
+  if (loadingEl) loadingEl.style.display = 'block';
+  
+  try {
+    const result = await dataManager.loadMoreFeedPosts(20);
+    
+    if (result.data && result.data.length > 0) {
+      feedPosts = [...feedPosts, ...result.data];
+      
+      if (activeTab === 'feed') {
+        renderMainApp();
+        restoreScrollPosition();
+      }
+      
+      showToast(`📥 Loaded ${result.data.length} more feed posts`, true);
+    }
+    
+    if (!result.hasMore || result.allLoaded) {
+      if (btn) {
+        btn.textContent = '✅ All feed posts loaded';
+        btn.disabled = true;
+      }
+    } else {
+      if (btn) {
+        btn.textContent = `📥 Load More Feed Posts`;
+        btn.disabled = false;
+      }
+    }
+  } catch (error) {
+    console.error('Error loading more feed posts:', error);
+    showToast('❌ Failed to load more feed posts', false);
+    if (btn) {
+      btn.textContent = '🔄 Try Again';
+      btn.disabled = false;
+    }
+  }
+  
+  isLoadingMore = false;
+  if (loadingEl) loadingEl.style.display = 'none';
+}
+
+// ============================================================
+// ===== REFRESH DATA (Pull to refresh) =====
+// ============================================================
+
+async function refreshAllData() {
+  console.log('🔄 Refreshing all data...');
+  showToast('🔄 Refreshing data...', true);
+  
+  try {
+    // Invalidate all cache
+    dataManager.invalidateAllCache();
+    
+    // Reset pagination
+    dataManager.resetPagination('community_posts');
+    dataManager.resetPagination('feed_posts');
+    
+    // Reload data
+    isFirstLoad = true;
+    await loadPostsOptimized();
+    
+    showToast('✅ Data refreshed!', true);
+  } catch (error) {
+    console.error('Error refreshing data:', error);
+    showToast('❌ Failed to refresh data', false);
+  }
 }
 
 // ============================================================
@@ -1250,6 +2152,72 @@ async function removePointsForInteraction(userId, postId) {
   }
 }
 
+
+// ============================================================
+// ===== FEED POST REACTIONS =====
+// ============================================================
+
+async function addReactionToFeedPost(postId, emoji) {
+  if (!currentUser) {
+    showToast('Please sign in to react', false);
+    return;
+  }
+  
+  const post = feedPosts.find(p => p.id === postId);
+  if (!post) {
+    showToast('Post not found. Please refresh and try again.', false);
+    return;
+  }
+  
+  const userId = currentUser.uid;
+  const reactionKey = `feed_reaction_${postId}_${userId}`;
+  const existingReaction = localStorage.getItem(reactionKey);
+  
+  try {
+    const postRef = db.collection('feed_posts').doc(postId);
+    const postDoc = await postRef.get();
+    
+    if (!postDoc.exists) {
+      showToast('Post not found in database.', false);
+      return;
+    }
+    
+    if (existingReaction === emoji) {
+      await postRef.update({
+        [`reactions.${emoji}`]: firebase.firestore.FieldValue.increment(-1)
+      });
+      localStorage.removeItem(reactionKey);
+      if (post.reactions && post.reactions[emoji]) {
+        post.reactions[emoji] = Math.max(0, post.reactions[emoji] - 1);
+      }
+      await removePointsForInteraction(userId, postId);
+      showToast('Reaction removed', true);
+    } else {
+      const updateData = {};
+      if (existingReaction) {
+        updateData[`reactions.${existingReaction}`] = firebase.firestore.FieldValue.increment(-1);
+        if (post.reactions && post.reactions[existingReaction]) {
+          post.reactions[existingReaction] = Math.max(0, post.reactions[existingReaction] - 1);
+        }
+      }
+      updateData[`reactions.${emoji}`] = firebase.firestore.FieldValue.increment(1);
+      await postRef.update(updateData);
+      localStorage.setItem(reactionKey, emoji);
+      
+      if (!post.reactions) post.reactions = {};
+      post.reactions[emoji] = (post.reactions[emoji] || 0) + 1;
+      
+      await awardPointsForInteraction(userId, postId, 'reacting to feed post');
+      showToast(`Reacted with ${emoji}! +10 points`, true);
+    }
+    renderMainApp();
+    restoreScrollPosition();
+  } catch (error) {
+    console.error('Error adding reaction:', error);
+    showToast('Failed to add reaction. Please try again.', false);
+  }
+}
+
 // ============================================================
 // ===== NOTIFICATION FUNCTIONS =====
 // ============================================================
@@ -1257,6 +2225,8 @@ async function removePointsForInteraction(userId, postId) {
 async function markNotificationRead(notifId) {
   try {
     await db.collection('notifications').doc(notifId).update({ read: true });
+    // Update cache
+    dataManager.invalidateCache(`notifications_${currentUser?.uid}`);
     return true;
   } catch (error) {
     console.error('Error marking notification:', error);
@@ -1274,6 +2244,7 @@ async function markAllNotificationsRead() {
       }
     });
     await batch.commit();
+    dataManager.invalidateCache(`notifications_${currentUser?.uid}`);
     return true;
   } catch (error) {
     console.error('Error marking all as read:', error);
@@ -1297,6 +2268,7 @@ async function addNotification(notificationData) {
       parentCommentId: notificationData.parentCommentId || '',
       replyText: notificationData.replyText || ''
     });
+    dataManager.invalidateCache(`notifications_${currentUser?.uid}`);
     return true;
   } catch (error) {
     console.error('Error adding notification:', error);
@@ -1381,7 +2353,6 @@ async function addEmojiReaction(postId, emoji) {
         postEmojiReactions[userReactionKey] = emoji;
         await awardPointsForInteraction(userId, postId, 'reacting with emoji');
         
-        // ===== ANALYTICS =====
         logEvent('emoji_reaction', {
           post_id: postId,
           emoji: emoji,
@@ -1394,6 +2365,7 @@ async function addEmojiReaction(postId, emoji) {
     
     saveUserReactions();
     
+    // Update local data
     const localPost = communityPosts.find(p => p.id === postId);
     if (localPost) {
       const freshPost = await postRef.get();
@@ -1563,331 +2535,13 @@ function closeEmojiPicker() {
 }
 
 // ============================================================
-// ===== FIRESTORE FUNCTIONS =====
+// ===== FIRESTORE FUNCTIONS (Legacy support) =====
 // ============================================================
 
 function loadPosts() {
-  db.collection('adminPosts')
-    .orderBy('timestamp', 'desc')
-    .onSnapshot((snapshot) => {
-      adminPosts = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        adminPosts.push({
-          id: doc.id,
-          user: data.user || 'DHouse Admin',
-          time: data.time || 'Just now',
-          content: data.content || '',
-          likes: data.likes || 0,
-          comments: data.comments || 0,
-          shares: data.shares || 0,
-          liked: data.liked || false,
-          images: data.images || [],
-          timestamp: data.timestamp
-        });
-      });
-      if (!isAdmin && activeTab === 'feed') renderMainApp();
-    }, (error) => {
-      console.log('Admin posts error:', error);
-    });
-
-  db.collection('community_posts')
-    .orderBy('createdAt', 'desc')
-    .onSnapshot((snapshot) => {
-      communityPosts = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        communityPosts.push({
-          id: doc.id,
-          user: data.username || data.user || 'Anonymous',
-          username: data.username || '@user',
-          userId: data.userId || '',
-          time: data.createdAt?.toDate?.()?.toLocaleString() || 'Just now',
-          content: data.content || '',
-          likes: data.likes || 0,
-          comments: data.commentCount || data.comments || 0,
-          commentCount: data.commentCount || data.comments || 0,
-          shares: data.shares || 0,
-          liked: data.liked || false,
-          tags: data.tags || [],
-          images: data.imageUrls || data.images || [],
-          emojiReactions: data.emojiReactions || {},
-          timestamp: data.createdAt || data.timestamp,
-          createdAt: data.createdAt
-        });
-      });
-      isDataLoaded = true;
-      if (!isAdmin && activeTab === 'community') {
-        renderMainApp();
-      }
-    }, (error) => {
-      console.log('Community posts error:', error);
-    });
-
-  db.collection('feed_posts')
-    .orderBy('createdAt', 'desc')
-    .onSnapshot((snapshot) => {
-      feedPosts = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        feedPosts.push({
-          id: doc.id,
-          type: data.type || 'text',
-          content: data.message || data.content || '',
-          message: data.message || '',
-          imageUrls: data.imageUrls || [],
-          pollOptions: data.pollOptions || [],
-          pollVotes: data.pollVotes || {},
-          likes: data.likes || 0,
-          comments: data.commentCount || data.comments || 0,
-          commentCount: data.commentCount || data.comments || 0,
-          reactions: data.reactions || {},
-          liked: data.liked || false,
-          timestamp: data.createdAt || data.timestamp,
-          time: data.createdAt?.toDate?.()?.toLocaleString() || 'Just now',
-          user: data.user || 'DHouse Admin',
-          displayIcons: data.displayIcons || [],
-          reactionIcons: data.reactionIcons || [],
-          votes: data.votes || [],
-          createdAt: data.createdAt,
-          emojiReactions: data.emojiReactions || {}
-        });
-      });
-      if (!isAdmin && activeTab === 'feed') {
-        renderMainApp();
-        restoreScrollPosition();
-      }
-    }, (error) => {
-      console.log('Feed posts error:', error);
-    });
-
-  db.collection('housemates')
-    .orderBy('name', 'asc')
-    .onSnapshot((snapshot) => {
-      housemates = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        housemates.push({
-          id: doc.id,
-          ...data
-        });
-      });
-      if (activeTab === 'housemates') {
-        renderMainApp();
-      }
-    }, (error) => {
-      console.log('Housemates error:', error);
-    });
-
-  db.collection('predictions')
-    .orderBy('createdAt', 'desc')
-    .onSnapshot((snapshot) => {
-      predictions = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        predictions.push({
-          id: doc.id,
-          ...data
-        });
-      });
-      if (activeTab === 'predictions') {
-        renderMainApp();
-      }
-    }, (error) => {
-      console.log('Predictions error:', error);
-    });
-
-  if (currentUser) {
-    db.collection('user_predictions')
-      .where('userId', '==', currentUser.uid)
-      .onSnapshot((snapshot) => {
-        userPredictions = {};
-        snapshot.forEach((doc) => {
-          const data = doc.data();
-          userPredictions[data.predictionId] = {
-            id: doc.id,
-            ...data
-          };
-        });
-        if (activeTab === 'predictions') {
-          renderMainApp();
-        }
-      }, (error) => {
-        console.log('User predictions error:', error);
-      });
-  }
-
-  db.collection('ads')
-    .orderBy('createdAt', 'desc')
-    .onSnapshot((snapshot) => {
-      allAds = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        allAds.push({ id: doc.id, ...data });
-      });
-      if (isAdmin && adminCurrentView === 'ads') {
-        renderAdminApp();
-      }
-    }, (error) => {
-      console.log('All ads error:', error);
-    });
-
-  db.collection('ads')
-    .where('status', '==', 'approved')
-    .onSnapshot((snapshot) => {
-      approvedAds = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        if ((data.budgetLeft || 0) <= 0) return;
-        if (data.targetLocation) {
-          const userCountry = currentUserProfile?.country || '';
-          const userState = currentUserProfile?.state || '';
-          const adCountry = data.country || '';
-          const adState = data.state || '';
-          if (adCountry && userCountry.toLowerCase() !== adCountry.toLowerCase()) return;
-          if (adState && userState.toLowerCase() !== adState.toLowerCase()) return;
-        }
-        approvedAds.push({ id: doc.id, ...data });
-        if (data.imageUrl && !adImageCache[data.imageUrl]) {
-          adImageCache[data.imageUrl] = true;
-          const img = new Image();
-          img.src = data.imageUrl;
-        }
-      });
-      approvedAds = approvedAds.sort(() => Math.random() - 0.5);
-      adIndex = 0;
-      trackedAdImpressions = new Set();
-      console.log(`📢 Loaded ${approvedAds.length} approved ads`);
-      if (activeTab === 'feed' || activeTab === 'community') {
-        renderMainApp();
-        restoreScrollPosition();
-      }
-    }, (error) => {
-      console.log('Ads error:', error);
-    });
-
-  if (currentUser) {
-    db.collection('ads')
-      .where('userId', '==', currentUser.uid)
-      .onSnapshot((snapshot) => {
-        userAds = [];
-        snapshot.forEach((doc) => {
-          userAds.push({ id: doc.id, ...doc.data() });
-        });
-        userAds.sort((a, b) => {
-          const aTime = a.createdAt?.toDate?.()?.getTime() || 0;
-          const bTime = b.createdAt?.toDate?.()?.getTime() || 0;
-          return bTime - aTime;
-        });
-        if (showAdsScreen) {
-          renderAdsScreen();
-        }
-      }, (error) => {
-        console.log('User ads error:', error);
-      });
-  }
-
-  if (currentUser) {
-    db.collection('notifications')
-      .where('to', '==', currentUser.uid)
-      .onSnapshot((snapshot) => {
-        notifications = [];
-        snapshot.forEach((doc) => {
-          const data = doc.data();
-          notifications.push({
-            id: doc.id,
-            type: data.type || 'tag',
-            from: data.from || '',
-            to: data.to || '',
-            message: data.message || '',
-            read: data.read || false,
-            time: data.time || 'Just now',
-            timestamp: data.timestamp,
-            fromName: data.fromName || 'Someone',
-            postId: data.postId || '',
-            commentId: data.commentId || '',
-            parentCommentId: data.parentCommentId || '',
-            replyText: data.replyText || ''
-          });
-        });
-        notifications.sort((a, b) => {
-          if (a.timestamp && b.timestamp) {
-            return b.timestamp - a.timestamp;
-          }
-          return 0;
-        });
-        notificationCount = notifications.filter(n => !n.read).length;
-        if (!isAdmin && activeTab === 'notifications') renderMainApp();
-        if (isAdmin) renderAdminApp();
-      }, (error) => {
-        console.log('Notifications error:', error);
-      });
-  }
-
-  if (isAdmin) {
-    db.collection('daily_words')
-      .orderBy('date', 'desc')
-      .onSnapshot((snapshot) => {
-        dailyWords = [];
-        snapshot.forEach((doc) => {
-          dailyWords.push({ id: doc.id, ...doc.data() });
-        });
-        if (adminCurrentView === 'wordgame') renderAdminApp();
-      }, (error) => {
-        console.log('Daily words error:', error);
-      });
-  } else {
-    const today = new Date().toISOString().split('T')[0];
-    db.collection('daily_words')
-      .where('date', '>=', today)
-      .orderBy('date', 'asc')
-      .onSnapshot(async (snapshot) => {
-        currentWordGames = [];
-        for (const doc of snapshot.docs) {
-          const wordData = { id: doc.id, ...doc.data() };
-          if (currentUser) {
-            try {
-              const subSnapshot = await db.collection('word_submissions')
-                .where('wordId', '==', doc.id)
-                .where('userId', '==', currentUser.uid)
-                .get();
-              wordData.userSubmitted = !subSnapshot.empty;
-            } catch (e) {
-              wordData.userSubmitted = false;
-            }
-          } else {
-            wordData.userSubmitted = false;
-          }
-          currentWordGames.push(wordData);
-        }
-        if (activeTab === 'wordgame') renderMainApp();
-      }, (error) => {
-        console.log('Today word error:', error);
-      });
-  }
-}
-
-async function addCommunityPostToFirestore(postData) {
-  try {
-    await db.collection('community_posts').add({
-      username: postData.user,
-      user: postData.user,
-      userId: postData.userId || '',
-      content: postData.content,
-      likes: 0,
-      commentCount: 0,
-      shares: 0,
-      liked: false,
-      tags: postData.tags || [],
-      imageUrls: postData.images || [],
-      emojiReactions: {},
-      createdAt: firebase.firestore.FieldValue.serverTimestamp()
-    });
-    return true;
-  } catch (error) {
-    console.error('Error adding post:', error);
-    return false;
-  }
+  // This is now replaced by loadPostsOptimized()
+  // Kept for backward compatibility
+  loadPostsOptimized();
 }
 
 // ============================================================
@@ -1924,6 +2578,7 @@ async function createAdRequest(adData) {
       dailyImpressions: {},
       paymentVerified: false
     });
+    dataManager.invalidateCache('ads');
     showToast('✅ Ad request created! Please complete payment.', true);
     return uniqueCode;
   } catch (error) {
@@ -2064,6 +2719,7 @@ async function verifyAdPayment(adId) {
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
     
+    dataManager.invalidateCache('ads');
     showToast('✅ Payment verified and ad approved!', true);
     renderAdminApp();
   } catch (error) {
@@ -2151,7 +2807,6 @@ function renderAdBanner(ad) {
   if (!ad) return '';
   setTimeout(() => {
     trackAdDisplay(ad.id);
-    // ===== ANALYTICS =====
     logEvent('ad_impression', {
       ad_id: ad.id,
       business_name: ad.businessName
@@ -2276,6 +2931,7 @@ async function submitPrediction(predictionId) {
       votedAt: firebase.firestore.FieldValue.serverTimestamp(),
       isCorrect: false
     });
+    dataManager.invalidateCache(`user_predictions_${currentUser.uid}`);
     showToast('✅ Prediction submitted!', true);
     await awardPointsForInteraction(currentUser.uid, predictionId, 'making a prediction');
     renderMainApp();
@@ -2292,14 +2948,8 @@ async function submitPrediction(predictionId) {
 
 async function loadAllUsers() {
   try {
-    const snapshot = await db.collection('users').get();
-    allUsers = [];
-    snapshot.forEach((doc) => {
-      allUsers.push({
-        id: doc.id,
-        ...doc.data()
-      });
-    });
+    const result = await dataManager.getAllUsers();
+    allUsers = result.data || [];
     return allUsers;
   } catch (error) {
     console.error('Error loading users:', error);
@@ -2326,6 +2976,7 @@ async function sendNotificationToAll(message) {
       });
     });
     await batch.commit();
+    dataManager.invalidateCache(`notifications_${currentUser?.uid}`);
     return true;
   } catch (error) {
     console.error('Error sending notification to all:', error);
@@ -2346,6 +2997,7 @@ async function sendNotificationToUser(uid, message) {
       time: 'Just now',
       timestamp: firebase.firestore.FieldValue.serverTimestamp()
     });
+    dataManager.invalidateCache(`notifications_${uid}`);
     return true;
   } catch (error) {
     console.error('Error sending notification to user:', error);
@@ -2371,6 +3023,9 @@ async function sendNotificationToList(uidList, message) {
       });
     });
     await batch.commit();
+    uidList.forEach(uid => {
+      dataManager.invalidateCache(`notifications_${uid}`);
+    });
     return true;
   } catch (error) {
     console.error('Error sending notification to list:', error);
@@ -2390,6 +3045,8 @@ async function deleteUserAccount(uid) {
       batch.delete(doc.ref);
     });
     await batch.commit();
+    dataManager.invalidateCache('all_users');
+    dataManager.invalidateCache(`notifications_${uid}`);
     alert('✅ User deleted successfully!');
     await loadAllUsers();
     renderAdminApp();
@@ -2565,6 +3222,7 @@ async function deleteUserPost(postId, event) {
     });
     await batch.commit();
     
+    dataManager.invalidateCache('community_posts');
     showToast('✅ Post deleted successfully!', true);
     renderMainApp();
   } catch (error) {
@@ -2590,6 +3248,7 @@ async function addHousemate(housemateData) {
       status: housemateData.status || 'in-game',
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
     });
+    dataManager.invalidateCache('housemates');
     showToast('✅ Housemate added successfully!', true);
     return true;
   } catch (error) {
@@ -2605,6 +3264,7 @@ async function deleteHousemate(housemateId) {
   }
   try {
     await db.collection('housemates').doc(housemateId).delete();
+    dataManager.invalidateCache('housemates');
     showToast('✅ Housemate deleted successfully!', true);
     return true;
   } catch (error) {
@@ -2620,6 +3280,7 @@ async function updateHousemateStatus(housemateId, status) {
       status: status,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
+    dataManager.invalidateCache('housemates');
     showToast(`✅ Status updated to ${status === 'in-game' ? 'In Game' : 'Evicted'}!`, true);
     return true;
   } catch (error) {
@@ -3214,6 +3875,7 @@ async function createFeedPost(postData) {
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       emojiReactions: {}
     });
+    dataManager.invalidateCache('feed_posts');
     showToast('✅ Feed post created!', true);
     return true;
   } catch (error) {
@@ -3238,6 +3900,7 @@ async function createPrediction(predictionData) {
       isActive: true,
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
     });
+    dataManager.invalidateCache('predictions');
     showToast('✅ Prediction created!', true);
     return true;
   } catch (error) {
@@ -3288,6 +3951,7 @@ async function setCorrectAnswer(predictionId, correctAnswer) {
       
       if (userPredsSnapshot.empty) {
         showToast(`✅ Correct answer set to "${correctAnswer}"! No users voted on this prediction.`, true);
+        dataManager.invalidateCache('predictions');
         return true;
       }
       
@@ -3330,6 +3994,10 @@ async function setCorrectAnswer(predictionId, correctAnswer) {
       await batch.commit();
       console.log(`✅ Batch committed: ${correctCount} users got it right!`);
       showToast(`✅ Correct answer set to "${correctAnswer}"! ${correctCount} users got it right! (+${pointsValue} pts each)`, true);
+      
+      // Invalidate caches
+      dataManager.invalidateCache('predictions');
+      dataManager.invalidateCache(`user_predictions_${currentUser?.uid}`);
       
     } catch (permissionError) {
       console.log('⚠️ Could not read user_predictions (permission denied), but prediction was updated');
@@ -3718,7 +4386,6 @@ async function handleLogin(e) {
   
   try {
     await auth.signInWithEmailAndPassword(email, password);
-    // ===== ANALYTICS =====
     logEvent('login', { method: 'email' });
   } catch (error) {
     alert('❌ ' + error.message);
@@ -3806,7 +4473,6 @@ async function handleSignup(e) {
       createdAt: new Date()
     });
     
-    // ===== ANALYTICS =====
     logEvent('sign_up', {
       method: 'email',
       username: username,
@@ -3867,7 +4533,6 @@ function openSearchScreen() {
 function closeSearchScreen() {
   showSearchScreen = false;
   searchQuery = '';
-  searchResults = [];
   renderMainApp();
 }
 
@@ -3915,7 +4580,6 @@ async function performSearch(query) {
       p.username?.toLowerCase().includes(searchTerm)
     );
     
-    // ===== ANALYTICS =====
     logEvent('search', {
       query: query,
       result_count: filteredPosts.length
@@ -4089,7 +4753,6 @@ function renderAdminApp() {
     default: content = renderAdminDashboard();
   }
   
-  // ===== ANALYTICS: ADMIN SCREEN VIEW =====
   logScreenView('admin_' + adminCurrentView);
   
   root.innerHTML = `
@@ -4128,6 +4791,8 @@ function renderAdminDashboard() {
   const totalPredictions = predictions.length;
   const totalAds = allAds.filter(a => a.status === 'approved').length;
   const pendingAds = allAds.filter(a => a.status === 'pending_payment' || a.status === 'pending').length;
+  const totalLikes = communityPosts.reduce((sum, p) => sum + (p.likes || 0), 0);
+  const totalComments = communityPosts.reduce((sum, p) => sum + (p.comments || 0), 0);
   
   return `
     <div class="admin-dashboard">
@@ -5058,6 +5723,119 @@ function renderSingleFeedPost(post) {
   `;
 }
 
+
+// ============================================================
+// ===== COMMENT ON FEED POST =====
+// ============================================================
+
+async function commentFeedPost(postId) {
+  if (!currentUser) {
+    showToast('Please sign in to comment', false);
+    return;
+  }
+  
+  // Find the post to make sure it exists
+  const post = feedPosts.find(p => p.id === postId);
+  if (!post) {
+    showToast('Post not found.', false);
+    return;
+  }
+  
+  // Open the comment sheet for this feed post
+  currentCommentPostId = postId;
+  currentCommentPostType = 'feed';
+  openCommentSheet(postId, 'feed');
+}
+
+
+// ============================================================
+// ===== SHARE FEED POST =====
+// ============================================================
+
+async function shareFeedPost(postId) {
+  const post = feedPosts.find(p => p.id === postId);
+  if (!post) return;
+  
+  try {
+    await db.collection('feed_posts').doc(postId).update({
+      shares: firebase.firestore.FieldValue.increment(1)
+    });
+    post.shares = (post.shares || 0) + 1;
+    await awardPointsForInteraction(currentUser?.uid, postId, 'sharing feed post');
+    showToast('📤 Feed post shared! +10 points', true);
+    renderMainApp();
+    restoreScrollPosition();
+  } catch (error) {
+    console.error('Error sharing feed post:', error);
+    showToast('Failed to share.', false);
+  }
+}
+
+// ============================================================
+// ===== SUBMIT WORD GAME ANSWER =====
+// ============================================================
+
+async function submitWordGameAnswer(gameId) {
+  const input = document.getElementById(`wordGameInput_${gameId}`);
+  if (!input) return;
+  const answer = input.value.trim();
+  if (!answer) {
+    showToast('Please enter a word.', false);
+    return;
+  }
+  const game = currentWordGames.find(g => g.id === gameId);
+  if (!game) {
+    showToast('Word game not found.', false);
+    return;
+  }
+  const success = await submitWordAnswer(gameId, answer);
+  if (success) {
+    game.userSubmitted = true;
+    renderMainApp();
+    restoreScrollPosition();
+  }
+}
+
+
+// ============================================================
+// ===== VOTE ON POLL =====
+// ============================================================
+
+async function voteOnPoll(postId, optionIndex) {
+  if (!currentUser) {
+    showToast('Please sign in to vote', false);
+    return;
+  }
+  
+  const post = feedPosts.find(p => p.id === postId);
+  if (!post) return;
+  
+  const userId = currentUser.uid;
+  const voteKey = `poll_vote_${postId}`;
+  const existingVote = localStorage.getItem(voteKey);
+  
+  try {
+    const updateData = {};
+    if (existingVote !== undefined && existingVote !== null) {
+      updateData[`pollVotes.${existingVote}`] = firebase.firestore.FieldValue.increment(-1);
+    }
+    updateData[`pollVotes.${optionIndex}`] = firebase.firestore.FieldValue.increment(1);
+    await db.collection('feed_posts').doc(postId).update(updateData);
+    localStorage.setItem(voteKey, String(optionIndex));
+    if (existingVote === undefined || existingVote === null) {
+      await awardPointsForInteraction(userId, postId, 'voting on poll');
+      showToast('🗳️ Vote cast! +10 points', true);
+    }
+    renderMainApp();
+    restoreScrollPosition();
+  } catch (error) {
+    console.error('Error voting on poll:', error);
+    showToast('Failed to vote.', false);
+  }
+}
+
+
+
 function renderFeed() {
   if (feedPosts.length === 0) {
     return `
@@ -5103,13 +5881,13 @@ function renderFeed() {
   // Add "load more" for feed if there are more posts
   const hasMoreFeedPosts = remainingPosts.length > 0;
   const loadMoreHTML = `
-    <div id="feedLoadingMore" style="text-align:center;padding:1rem;color:#6b7280;display:none;">
+    <div id="loadingMoreFeed" style="text-align:center;padding:1rem;color:#6b7280;display:none;">
       <div class="spinner" style="width:24px;height:24px;border:2px solid #2a2a4e;border-top-color:#e94560;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 8px;"></div>
       <p>Loading more posts...</p>
     </div>
     ${hasMoreFeedPosts ? `
       <button onclick="loadMoreFeedPosts()" id="loadMoreFeedBtn" style="width:100%;padding:0.8rem;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:12px;color:#a7a9be;cursor:pointer;font-size:0.9rem;margin-top:0.5rem;">
-        Load More Feed Posts (${remainingPosts.length} remaining)
+        📥 Load More Feed Posts (${remainingPosts.length} remaining)
       </button>
     ` : `
       <div style="text-align:center;padding:1rem;color:#6b7280;">
@@ -5139,339 +5917,6 @@ function renderFeed() {
 
 let feedBatchSize = 10;
 let feedBatchIndex = 0;
-
-function loadMoreFeedPosts() {
-  const container = document.getElementById('feedPostsContainer');
-  if (!container) return;
-  
-  const btn = document.getElementById('loadMoreFeedBtn');
-  const loadingEl = document.getElementById('feedLoadingMore');
-  
-  if (btn) btn.style.display = 'none';
-  if (loadingEl) loadingEl.style.display = 'block';
-  
-  const startIndex = feedBatchIndex + 10;
-  const endIndex = Math.min(startIndex + 10, feedPosts.length);
-  const nextBatch = feedPosts.slice(startIndex, endIndex);
-  
-  if (nextBatch.length > 0) {
-    // Remove the sentinel
-    const sentinel = document.getElementById('feedScrollSentinel');
-    if (sentinel) sentinel.remove();
-    
-    let html = '';
-    nextBatch.forEach(post => {
-      html += renderSingleFeedPost(post);
-    });
-    
-    // Insert before the existing elements
-    if (loadingEl) {
-      loadingEl.insertAdjacentHTML('beforebegin', html);
-    } else {
-      container.insertAdjacentHTML('beforeend', html);
-    }
-    
-    feedBatchIndex += nextBatch.length;
-    
-    // Check if there are more posts
-    if (feedBatchIndex + 10 < feedPosts.length) {
-      // Show load more button again
-      const newBtn = document.createElement('button');
-      newBtn.id = 'loadMoreFeedBtn';
-      newBtn.style.cssText = 'width:100%;padding:0.8rem;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:12px;color:#a7a9be;cursor:pointer;font-size:0.9rem;margin-top:0.5rem;';
-      newBtn.textContent = `Load More Feed Posts (${feedPosts.length - feedBatchIndex - 10} remaining)`;
-      newBtn.onclick = loadMoreFeedPosts;
-      
-      if (loadingEl) {
-        loadingEl.insertAdjacentElement('beforebegin', newBtn);
-      }
-    } else {
-      if (loadingEl) {
-        loadingEl.style.display = 'none';
-        const endMsg = document.createElement('div');
-        endMsg.style.cssText = 'text-align:center;padding:1rem;color:#6b7280;';
-        endMsg.innerHTML = '<p>— End of feed —</p>';
-        loadingEl.insertAdjacentElement('beforebegin', endMsg);
-      }
-    }
-    
-    // Lazy load new images
-    setTimeout(setupLazyLoading, 100);
-  }
-  
-  if (loadingEl) loadingEl.style.display = 'none';
-}
-
-function openFeedImageViewer(postId) {
-  const post = feedPosts.find(p => p.id === postId);
-  if (post && post.imageUrls && post.imageUrls.length > 0) {
-    viewerType = 'image';
-    viewerPost = post;
-    viewerImages = post.imageUrls;
-    viewerImageIndex = 0;
-    renderViewer();
-  }
-}
-
-async function commentFeedPost(postId) {
-  if (!currentUser) {
-    showToast('Please sign in to comment', false);
-    return;
-  }
-  currentCommentPostId = postId;
-  currentCommentPostType = 'feed';
-  openCommentSheet(postId, 'feed');
-}
-
-async function shareFeedPost(postId) {
-  const post = feedPosts.find(p => p.id === postId);
-  if (!post) return;
-  try {
-    await db.collection('feed_posts').doc(postId).update({
-      shares: firebase.firestore.FieldValue.increment(1)
-    });
-    post.shares = (post.shares || 0) + 1;
-    await awardPointsForInteraction(currentUser?.uid, postId, 'sharing feed post');
-    showToast('📤 Feed post shared! +10 points', true);
-    renderMainApp();
-    restoreScrollPosition();
-  } catch (error) {
-    console.error('Error sharing feed post:', error);
-    showToast('Failed to share.', false);
-  }
-}
-
-async function likeFeedPost(postId) {
-  const post = feedPosts.find(p => p.id === postId);
-  if (!post) return;
-  const userId = currentUser?.uid;
-  
-  const likeKey = `feed_like_${postId}`;
-  if (pendingLikes.has(likeKey)) return;
-  pendingLikes.add(likeKey);
-  
-  const newLiked = !post.liked;
-  const increment = newLiked ? 1 : -1;
-  
-  try {
-    post.liked = newLiked;
-    post.likes = (post.likes || 0) + (newLiked ? 1 : -1);
-    
-    await db.collection('feed_posts').doc(postId).update({
-      likes: firebase.firestore.FieldValue.increment(increment),
-      liked: newLiked
-    });
-    
-    if (newLiked) {
-      await awardPointsForInteraction(userId, postId, 'liking feed post');
-      // ===== ANALYTICS =====
-      logEvent('post_liked', {
-        post_id: postId,
-        type: 'feed'
-      });
-      showToast('❤️ Liked! +10 points', true);
-    } else {
-      await removePointsForInteraction(userId, postId);
-      showToast('❤️ Unliked! -10 points', true);
-    }
-    
-    if (userId === currentUser?.uid) {
-      currentUserPoints = newLiked ? currentUserPoints + 10 : Math.max(0, currentUserPoints - 10);
-    }
-    
-    renderMainApp();
-    restoreScrollPosition();
-  } catch (error) {
-    console.error('Error liking feed post:', error);
-    post.liked = !newLiked;
-    post.likes = (post.likes || 0) - (newLiked ? 1 : -1);
-    showToast('Failed to like. Please try again.', false);
-  }
-  pendingLikes.delete(likeKey);
-}
-
-// ============================================================
-// ===== FEED POST REACTIONS (legacy) =====
-// ============================================================
-
-async function addReactionToFeedPost(postId, emoji) {
-  if (!currentUser) {
-    showToast('Please sign in to react', false);
-    return;
-  }
-  
-  const post = feedPosts.find(p => p.id === postId);
-  if (!post) {
-    showToast('Post not found. Please refresh and try again.', false);
-    return;
-  }
-  
-  const userId = currentUser.uid;
-  const reactionKey = `feed_reaction_${postId}_${userId}`;
-  const existingReaction = localStorage.getItem(reactionKey);
-  
-  try {
-    const postRef = db.collection('feed_posts').doc(postId);
-    const postDoc = await postRef.get();
-    
-    if (!postDoc.exists) {
-      showToast('Post not found in database.', false);
-      return;
-    }
-    
-    if (existingReaction === emoji) {
-      await postRef.update({
-        [`reactions.${emoji}`]: firebase.firestore.FieldValue.increment(-1)
-      });
-      localStorage.removeItem(reactionKey);
-      if (post.reactions && post.reactions[emoji]) {
-        post.reactions[emoji] = Math.max(0, post.reactions[emoji] - 1);
-      }
-      await removePointsForInteraction(userId, postId);
-      showToast('Reaction removed', true);
-    } else {
-      const updateData = {};
-      if (existingReaction) {
-        updateData[`reactions.${existingReaction}`] = firebase.firestore.FieldValue.increment(-1);
-        if (post.reactions && post.reactions[existingReaction]) {
-          post.reactions[existingReaction] = Math.max(0, post.reactions[existingReaction] - 1);
-        }
-      }
-      updateData[`reactions.${emoji}`] = firebase.firestore.FieldValue.increment(1);
-      await postRef.update(updateData);
-      localStorage.setItem(reactionKey, emoji);
-      
-      if (!post.reactions) post.reactions = {};
-      post.reactions[emoji] = (post.reactions[emoji] || 0) + 1;
-      
-      await awardPointsForInteraction(userId, postId, 'reacting to feed post');
-      showToast(`Reacted with ${emoji}! +10 points`, true);
-    }
-    renderMainApp();
-    restoreScrollPosition();
-  } catch (error) {
-    console.error('Error adding reaction:', error);
-    showToast('Failed to add reaction. Please try again.', false);
-  }
-}
-
-async function voteOnPoll(postId, optionIndex) {
-  if (!currentUser) {
-    showToast('Please sign in to vote', false);
-    return;
-  }
-  const post = feedPosts.find(p => p.id === postId);
-  if (!post) return;
-  const userId = currentUser.uid;
-  const voteKey = `poll_vote_${postId}`;
-  const existingVote = localStorage.getItem(voteKey);
-  
-  try {
-    const updateData = {};
-    if (existingVote !== undefined && existingVote !== null) {
-      updateData[`pollVotes.${existingVote}`] = firebase.firestore.FieldValue.increment(-1);
-    }
-    updateData[`pollVotes.${optionIndex}`] = firebase.firestore.FieldValue.increment(1);
-    await db.collection('feed_posts').doc(postId).update(updateData);
-    localStorage.setItem(voteKey, String(optionIndex));
-    if (existingVote === undefined || existingVote === null) {
-      await awardPointsForInteraction(userId, postId, 'voting on poll');
-    }
-    renderMainApp();
-    restoreScrollPosition();
-  } catch (error) {
-    console.error('Error voting on poll:', error);
-    showToast('Failed to vote.', false);
-  }
-}
-
-// ============================================================
-// ===== USER WORD GAME VIEW =====
-// ============================================================
-
-function renderWordGame() {
-  const today = new Date().toISOString().split('T')[0];
-  const activeGames = currentWordGames.filter(game => game.date >= today);
-  
-  if (!activeGames || activeGames.length === 0) {
-    return `
-      <div class="wordgame-container" style="padding:1rem;">
-        <h2 style="color:#fffffe;margin-bottom:1rem;">🎯 Word Games</h2>
-        <div style="background:#1a1a2e;border-radius:16px;padding:2rem;text-align:center;border:1px solid #2a2a4e;">
-          <p style="color:#6b7280;">No active word games available right now. Check back later!</p>
-        </div>
-      </div>
-    `;
-  }
-  
-  let gamesHTML = '';
-  for (const game of activeGames) {
-    const word = game.word;
-    const hint = game.hint;
-    const sponsorImage = game.sponsorImage || '';
-    const colors = game.colors || {
-      heading: '#e94560',
-      answer: '#FFB300',
-      underscore: '#fffffe',
-      hint: '#a7a9be',
-      keyboard: '#2a2a4e',
-      score: '#e94560'
-    };
-    const alreadySubmitted = game.userSubmitted || false;
-    
-    gamesHTML += `
-      <div style="background:#1a1a2e;border-radius:16px;padding:1.5rem;border:1px solid #2a2a4e;margin-bottom:1rem;">
-        ${sponsorImage ? `<div style="text-align:center;margin-bottom:0.5rem;"><img src="${sponsorImage}" style="max-width:100%;max-height:100px;border-radius:8px;"></div>` : ''}
-        <div style="color:${colors.hint};margin:0.3rem 0;font-size:0.95rem;">💡 ${hint}</div>
-        
-        ${!alreadySubmitted ? `
-          <div style="display:flex;gap:0.5rem;margin-top:0.5rem;">
-            <input type="text" id="wordGameInput_${game.id}" placeholder="Enter answer..." style="flex:1;padding:0.6rem;background:#0f0e17;border:2px solid ${colors.keyboard};border-radius:10px;color:#fffffe;font-size:1rem;text-align:center;text-transform:uppercase;font-family:monospace;letter-spacing:2px;">
-            <button onclick="submitWordGameAnswer('${game.id}')" style="padding:0.6rem 1.2rem;background:#e94560;border:none;border-radius:10px;color:white;font-weight:600;cursor:pointer;">Submit</button>
-          </div>
-        ` : `
-          <div style="color:#4CAF50;font-weight:600;padding:0.3rem;">✅ You already submitted the correct word!</div>
-        `}
-      </div>
-    `;
-  }
-  
-  return `
-    <div class="wordgame-container" style="padding:1rem;max-width:500px;margin:0 auto;">
-      <h2 style="color:#fffffe;margin-bottom:1rem;text-align:center;">🎯 Word Games</h2>
-      ${gamesHTML}
-      <div style="margin-top:1rem;background:#1a1a2e;border-radius:16px;padding:1rem;border:1px solid #2a2a4e;">
-        <div style="color:#a7a9be;font-size:0.8rem;text-align:center;">
-          🔥 Earn 10 points for each correct word!
-        </div>
-        <div style="margin-top:0.5rem;font-size:0.9rem;color:#FFB300;text-align:center;">
-          Score: <span id="wordGameScore">${currentUserPoints || 0}</span> points
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-async function submitWordGameAnswer(gameId) {
-  const input = document.getElementById(`wordGameInput_${gameId}`);
-  if (!input) return;
-  const answer = input.value.trim();
-  if (!answer) {
-    showToast('Please enter a word.', false);
-    return;
-  }
-  const game = currentWordGames.find(g => g.id === gameId);
-  if (!game) {
-    showToast('Word game not found.', false);
-    return;
-  }
-  const success = await submitWordAnswer(gameId, answer);
-  if (success) {
-    game.userSubmitted = true;
-    renderMainApp();
-    restoreScrollPosition();
-  }
-}
 
 // ============================================================
 // ===== NOTIFICATION DETAIL =====
@@ -5753,8 +6198,7 @@ async function submitReplyView() {
         postId: postId,
         commentId: newCommentRef.id,
         parentCommentId: targetCommentId || '',
-        replyText: text
-      });
+        replyText: text      });
     }
     
     const postRef = db.collection('community_posts').doc(postId);
@@ -6154,14 +6598,20 @@ function renderCommunity() {
   
   // Add loading sentinel and "load more" UI
   const loadMoreHTML = `
-    <div id="loadingMore" style="text-align:center;padding:1rem;color:#6b7280;display:none;">
+    <div id="loadingMoreCommunity" style="text-align:center;padding:1rem;color:#6b7280;display:none;">
       <div class="spinner" style="width:24px;height:24px;border:2px solid #2a2a4e;border-top-color:#e94560;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 8px;"></div>
       <p>Loading more posts...</p>
     </div>
-    <div id="endOfPosts" style="text-align:center;padding:1rem;color:#6b7280;display:${hasMorePosts ? 'none' : 'block'};">
-      <p>— You've seen all posts —</p>
-    </div>
-    <div id="scrollSentinel" style="height:20px;width:100%;"></div>
+    ${hasMorePosts ? `
+      <button onclick="loadMoreCommunityPosts()" id="loadMoreCommunityBtn" style="width:100%;padding:0.8rem;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:12px;color:#a7a9be;cursor:pointer;font-size:0.9rem;margin-top:0.5rem;">
+        📥 Load More Posts (${remainingPosts.length} remaining)
+      </button>
+    ` : `
+      <div id="endOfPosts" style="text-align:center;padding:1rem;color:#6b7280;display:block;">
+        <p>— You've seen all posts —</p>
+      </div>
+    `}
+    <div id="scrollSentinel" style="height:10px;width:100%;"></div>
   `;
   
   return `
@@ -6224,7 +6674,6 @@ async function likeCommunityPost(postId, event) {
     
     if (newLiked) {
       await awardPointsForInteraction(userId, postId, 'liking a community post');
-      // ===== ANALYTICS =====
       logEvent('post_liked', {
         post_id: postId,
         type: 'community'
@@ -6246,10 +6695,26 @@ async function likeCommunityPost(postId, event) {
     post.liked = !newLiked;
     post.likes = Math.max(0, (post.likes || 0) - (newLiked ? 1 : -1));
     showToast('Failed to like. Please try again.', false);
+    
+    if (typeof Sentry !== 'undefined') {
+      Sentry.captureException(error, {
+        tags: {
+          operation: 'likeCommunityPost',
+          postId: postId,
+          userId: userId,
+          newLiked: newLiked,
+        },
+        extra: {
+          postId: postId,
+          userId: userId,
+          newLiked: newLiked,
+          errorMessage: error.message,
+        },
+      });
+    }
   }
   pendingLikes.delete(likeKey);
 }
-
 
 function togglePostMenu(event, postId) {
   event.stopPropagation();
@@ -6271,6 +6736,59 @@ function sortCommunity(mode) {
   renderMainApp();
   restoreScrollPosition();
 }
+
+// ============================================================
+// ===== FEED POST LIKE =====
+// ============================================================
+
+async function likeFeedPost(postId) {
+  const post = feedPosts.find(p => p.id === postId);
+  if (!post) return;
+  const userId = currentUser?.uid;
+  
+  const likeKey = `feed_like_${postId}`;
+  if (pendingLikes.has(likeKey)) return;
+  pendingLikes.add(likeKey);
+  
+  const newLiked = !post.liked;
+  const increment = newLiked ? 1 : -1;
+  
+  try {
+    post.liked = newLiked;
+    post.likes = (post.likes || 0) + (newLiked ? 1 : -1);
+    
+    await db.collection('feed_posts').doc(postId).update({
+      likes: firebase.firestore.FieldValue.increment(increment),
+      liked: newLiked
+    });
+    
+    if (newLiked) {
+      await awardPointsForInteraction(userId, postId, 'liking feed post');
+      logEvent('post_liked', {
+        post_id: postId,
+        type: 'feed'
+      });
+      showToast('❤️ Liked! +10 points', true);
+    } else {
+      await removePointsForInteraction(userId, postId);
+      showToast('❤️ Unliked! -10 points', true);
+    }
+    
+    if (userId === currentUser?.uid) {
+      currentUserPoints = newLiked ? currentUserPoints + 10 : Math.max(0, currentUserPoints - 10);
+    }
+    
+    renderMainApp();
+    restoreScrollPosition();
+  } catch (error) {
+    console.error('Error liking feed post:', error);
+    post.liked = !newLiked;
+    post.likes = (post.likes || 0) - (newLiked ? 1 : -1);
+    showToast('Failed to like. Please try again.', false);
+  }
+  pendingLikes.delete(likeKey);
+}
+
 
 // ============================================================
 // ===== PREDICTIONS (User View) =====
@@ -6831,6 +7349,7 @@ async function approveAd(adId) {
       approvedAt: firebase.firestore.FieldValue.serverTimestamp(),
       budgetLeft: adData.amount || 0
     });
+    dataManager.invalidateCache('ads');
     showToast('✅ Ad approved!', true);
     renderAdminApp();
   } catch (error) {
@@ -6847,6 +7366,7 @@ async function rejectAd(adId) {
       status: 'rejected',
       rejectedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
+    dataManager.invalidateCache('ads');
     showToast('✅ Ad rejected.', true);
     renderAdminApp();
   } catch (error) {
@@ -6859,6 +7379,7 @@ async function deleteAd(adId) {
   if (!confirm('Are you sure you want to delete this ad?')) return;
   try {
     await db.collection('ads').doc(adId).delete();
+    dataManager.invalidateCache('ads');
     showToast('✅ Ad deleted!', true);
     renderAdminApp();
   } catch (error) {
@@ -7138,6 +7659,7 @@ async function updateProfilePic(event) {
     });
     
     profileDataCache = null;
+    dataManager.invalidateCache(`user_${currentUser.uid}`);
     showToast('✅ Profile picture updated!', true);
     renderProfilePage();
   } catch (error) {
@@ -7358,6 +7880,7 @@ async function clearCache() {
       if (window.cache) {
         window.cache.clear();
       }
+      dataManager.invalidateAllCache();
       showToast('✅ Cache cleared successfully!', true);
       renderSettingsPage();
     } catch (error) {
@@ -7732,7 +8255,6 @@ async function submitCommentSheet() {
     
     const newCommentRef = await db.collection(collectionPath).add(commentData);
     
-    // ===== ANALYTICS =====
     logEvent('comment_created', {
       post_id: currentCommentPostId,
       post_type: currentCommentPostType,
@@ -7803,6 +8325,25 @@ async function submitCommentSheet() {
   } catch (error) {
     console.error('Error submitting comment:', error);
     showToast('❌ Failed to post comment: ' + error.message, false);
+    
+    if (typeof Sentry !== 'undefined') {
+      Sentry.captureException(error, {
+        tags: {
+          operation: 'submitComment',
+          postId: currentCommentPostId,
+          postType: currentCommentPostType,
+          isReply: !!commentSheetReplyingTo,
+        },
+        extra: {
+          postId: currentCommentPostId,
+          postType: currentCommentPostType,
+          isReply: !!commentSheetReplyingTo,
+          commentText: text?.substring(0, 100),
+          userId: currentUser?.uid,
+          errorMessage: error.message,
+        },
+      });
+    }
   }
   
   submitBtn.disabled = false;
@@ -7828,7 +8369,6 @@ async function sharePost(postId, isCommunity = true) {
     
     await awardPointsForInteraction(currentUser?.uid, postId, 'sharing');
     
-    // ===== ANALYTICS =====
     logEvent('post_shared', {
       post_id: postId,
       post_type: isCommunity ? 'community' : 'admin'
@@ -7985,7 +8525,6 @@ function renderMainApp() {
       break;
   }
   
-  // ===== ANALYTICS: SCREEN VIEW =====
   logScreenView(activeTab);
   
   const menuHTML = showMenu ? `
@@ -8039,7 +8578,6 @@ function renderMainApp() {
     </div>
   `;
   
-  // ===== SETUP LAZY LOADING AFTER RENDER =====
   setTimeout(() => {
     setupLazyLoading();
   }, 200);
@@ -8051,11 +8589,42 @@ function renderMainApp() {
 }
 
 // ============================================================
+// ===== TEST SENTRY (Remove after testing) =====
+// ============================================================
+
+function testSentry() {
+  console.log('🧪 Testing Sentry...');
+  
+  try {
+    throw new Error('🧪 Sentry test - if you see this in Sentry, it\'s working!');
+  } catch (error) {
+    console.log('📤 Sending test error to Sentry...');
+    
+    if (typeof Sentry !== 'undefined') {
+      Sentry.captureException(error, {
+        tags: { test: 'true' },
+        extra: {
+          timestamp: new Date().toISOString(),
+          source: 'manual_test',
+        },
+      });
+      
+      showToast('✅ Test error sent to Sentry! Check your Sentry dashboard.', true);
+      console.log('✅ Test error sent to Sentry!');
+    } else {
+      showToast('❌ Sentry not loaded. Check your setup.', false);
+      console.error('❌ Sentry not available');
+    }
+  }
+}
+
+window.testSentry = testSentry;
+
+// ============================================================
 // ===== LAZY LOADING SETUP =====
 // ============================================================
 
 function setupLazyLoading() {
-  // Clean up old observer
   if (postObserver) {
     postObserver.disconnect();
   }
@@ -8088,7 +8657,6 @@ function setupLazyLoading() {
     });
   }, options);
   
-  // Observe all images with data-src
   const images = document.querySelectorAll('img[data-src]');
   console.log(`🖼️ Found ${images.length} images to lazy load`);
   
@@ -8096,7 +8664,6 @@ function setupLazyLoading() {
     postObserver.observe(img);
   });
   
-  // Also check if any images are already visible (for fast scroll)
   setTimeout(() => {
     document.querySelectorAll('img[data-src]').forEach(img => {
       const rect = img.getBoundingClientRect();
@@ -8117,6 +8684,7 @@ function setupLazyLoading() {
     });
   }, 100);
 }
+
 function handleMenuOverlayClick() {
   closeMenu();
 }
@@ -8184,6 +8752,7 @@ function handleLogoutWithDialog() {
   
   auth.signOut().then(() => {
     overlay.remove();
+    dataManager.cleanupListeners();
     showToast('Logged out successfully', true);
   }).catch((error) => {
     overlay.remove();
@@ -8193,7 +8762,6 @@ function handleLogoutWithDialog() {
 }
 
 function switchTab(tabId) {
-  // ===== ANALYTICS =====
   logEvent('tab_switch', {
     from: activeTab,
     to: tabId
@@ -8207,6 +8775,64 @@ function switchTab(tabId) {
   activeTab = tabId;
   renderMainApp();
 }
+
+// ============================================================
+// ===== MIGRATION SCRIPT =====
+// ============================================================
+
+async function migrateData() {
+  console.log('🔄 Starting data migration...');
+  
+  try {
+    const counters = {
+      'total_posts': communityPosts.length,
+      'total_users': allUsers.length,
+      'total_likes': 0,
+      'total_comments': 0,
+    };
+    
+    for (const [key, value] of Object.entries(counters)) {
+      await db.collection('counters').doc(key).set({
+        value: value,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      });
+      console.log(`✅ Counter ${key}: ${value}`);
+    }
+    
+    console.log('✅ Counters created');
+    
+    for (const user of allUsers) {
+      const userPosts = communityPosts.filter(p => p.userId === user.id);
+      const userLikes = userPosts.reduce((sum, p) => sum + (p.likes || 0), 0);
+      
+      await db.collection('users').doc(user.id).collection('stats').doc('summary').set({
+        postCount: userPosts.length,
+        likeCount: userLikes,
+        commentCount: 0,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    
+    console.log('✅ User stats created');
+    
+    for (const post of communityPosts) {
+      await db.collection('community_posts').doc(post.id).collection('stats').doc('summary').set({
+        likeCount: post.likes || 0,
+        commentCount: post.comments || 0,
+        shareCount: post.shares || 0,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    
+    console.log('✅ Post stats created');
+    console.log('🎉 Migration complete!');
+    
+  } catch (error) {
+    console.error('Migration error:', error);
+  }
+}
+
+window.migrateData = migrateData;
 
 function togglePostExpand(postId) {
   expandedPosts[postId] = !expandedPosts[postId];
@@ -8445,7 +9071,6 @@ async function submitModalPost() {
         
         if (urls && urls.length > 0 && urls[0]) {
           imageUrls.push(urls[0]);
-          // ===== ANALYTICS =====
           logEvent('image_upload', {
             success: true,
             file_size: file.size,
@@ -8460,7 +9085,22 @@ async function submitModalPost() {
         console.error(`Image ${i + 1} upload failed:`, error);
         uploadFailed = true;
         failedFileNames.push(fileObj.name || `Image ${i + 1}`);
-        // ===== ANALYTICS =====
+        
+        if (typeof Sentry !== 'undefined') {
+          Sentry.captureException(error, {
+            tags: {
+              imageIndex: i + 1,
+              totalImages: totalImages,
+              postType: 'community',
+            },
+            extra: {
+              fileName: fileObj?.name || 'unknown',
+              fileSize: fileObj?.size || 0,
+              errorMessage: error.message,
+            },
+          });
+        }
+        
         logEvent('image_upload', {
           success: false,
           error: error.message || 'Unknown error',
@@ -8530,7 +9170,14 @@ async function submitModalPost() {
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
     });
     
-    // ===== ANALYTICS =====
+    if (postRef && postRef.id) {
+      await incrementCounter('total_posts', 1);
+      await incrementCounter(`user_${currentUser.uid}_posts`, 1);
+      await updateUserStats(currentUser.uid, {
+        lastPostAt: new Date().toISOString(),
+      });
+    }
+    
     logEvent('post_created', {
       has_images: imageUrls.length > 0,
       image_count: imageUrls.length,
@@ -8540,8 +9187,28 @@ async function submitModalPost() {
       post_id: postRef.id
     });
     
+    dataManager.invalidateCache('community_posts');
+    
   } catch (error) {
     console.error('Error adding post:', error);
+    
+    if (typeof Sentry !== 'undefined') {
+      Sentry.captureException(error, {
+        tags: {
+          hasImages: imageUrls.length > 0,
+          imageCount: imageUrls.length,
+          hasTags: tags.length > 0,
+          tagCount: tags.length,
+        },
+        extra: {
+          postText: postText?.substring(0, 200),
+          tags: tags,
+          userId: currentUser?.uid,
+          imageUrls: imageUrls,
+          errorMessage: error.message,
+        },
+      });
+    }
     
     if (imageUrls.length > 0) {
       await deleteR2Images(imageUrls);
@@ -8599,6 +9266,19 @@ async function submitModalPost() {
       }
     } catch (error) {
       console.error('Error processing tags:', error);
+      
+      if (typeof Sentry !== 'undefined') {
+        Sentry.captureException(error, {
+          tags: {
+            operation: 'tag_notification',
+            postId: postRef?.id,
+          },
+          extra: {
+            tags: tags,
+            userId: currentUser?.uid,
+          },
+        });
+      }
     }
   }
   
@@ -8624,16 +9304,22 @@ auth.onAuthStateChanged(async (user) => {
   if (user && user.emailVerified) {
     currentUser = user;
     
-        // ===== ANALYTICS: SET USER PROPERTIES =====
+    if (typeof Sentry !== 'undefined') {
+      Sentry.setUser({
+        id: user.uid,
+        email: user.email,
+        username: user.displayName || user.email?.split('@')[0],
+      });
+      console.log('📊 Sentry user context set for:', user.email);
+    }
+    
     setUserProperties({
       user_id: user.uid,
       email_domain: user.email ? user.email.split('@')[1] : 'unknown',
     });
     
-    // ===== CHECK ADMIN STATUS FROM FIRESTORE =====
     isAdmin = await isUserAdmin(user);
     
-    // ===== CHECK MAINTENANCE MODE =====
     if (await isMaintenanceMode() && !isAdmin) {
       alert('🔧 DHouse is currently under maintenance. Please check back later.');
       await auth.signOut();
@@ -8672,9 +9358,17 @@ auth.onAuthStateChanged(async (user) => {
     } catch (e) {
       console.log('Profile fetch error:', e);
     }
+    
     loadUserReactions();
-    loadPosts();
-    loadFlaggedPostsStatus();
+    await loadFlaggedPostsStatus();
+    
+    // Enable persistence and load data
+    if (!persistenceEnabled) {
+      await enableFirestorePersistence();
+    }
+    
+    await loadPostsOptimized();
+    
     if (isAdmin) {
       await loadAllUsers();
       renderAdminApp();
@@ -8683,6 +9377,10 @@ auth.onAuthStateChanged(async (user) => {
     }
   } else if (user) {
     currentUser = user;
+    
+    if (typeof Sentry !== 'undefined') {
+      Sentry.setUser(null);
+    }
     showAuth('login');
     alert('📧 Please verify your email. Check spam folder!');
   } else {
@@ -8690,6 +9388,14 @@ auth.onAuthStateChanged(async (user) => {
     currentUserProfile = null;
     isAdmin = false;
     profileDataCache = null;
+    
+    if (typeof Sentry !== 'undefined') {
+      Sentry.setUser(null);
+    }
+    
+    dataManager.cleanupListeners();
+    dataManager.invalidateAllCache();
+    
     if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone) {
       showAuth('login');
     } else {
@@ -8699,15 +9405,92 @@ auth.onAuthStateChanged(async (user) => {
 });
 
 // ============================================================
-// ===== SERVICE WORKER REGISTRATION (PWA) =====
+// ===== SERVICE WORKER REGISTRATION =====
 // ============================================================
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js')
-      .then(() => console.log('✅ Service worker registered'))
-      .catch(() => console.log('❌ Service worker registration failed'));
+    navigator.serviceWorker.register('/sw.js')
+      .then((registration) => {
+        console.log('✅ Service worker registered');
+        
+        setInterval(() => {
+          registration.update();
+          console.log('🔄 Checking for service worker updates...');
+        }, 60 * 60 * 1000);
+      })
+      .catch((error) => {
+        console.log('❌ Service worker registration failed:', error);
+      });
+    
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      console.log('🔄 Service worker controller changed');
+      showToast('🔄 New version available! Refresh to update.', true);
+    });
   });
+}
+
+// ============================================================
+// ===== SERVICE WORKER UPDATE NOTIFICATION =====
+// ============================================================
+
+if (navigator.serviceWorker) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'NEW_VERSION') {
+      showToast('🔄 New version available! Refresh to update.', true);
+    }
+  });
+}
+
+function checkForUpdates() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistration().then((registration) => {
+      if (registration) {
+        registration.update();
+        showToast('🔄 Checking for updates...', true);
+      }
+    });
+  }
+}
+
+window.checkForUpdates = checkForUpdates;
+
+// ============================================================
+// ===== COUNTER FUNCTIONS =====
+// ============================================================
+
+async function incrementCounter(counterName, amount = 1) {
+  try {
+    const counterRef = db.collection('counters').doc(counterName);
+    await counterRef.set({
+      value: firebase.firestore.FieldValue.increment(amount),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (error) {
+    console.error('Error incrementing counter:', error);
+  }
+}
+
+async function getCounterValue(counterName) {
+  try {
+    const doc = await db.collection('counters').doc(counterName).get();
+    return doc.exists ? doc.data().value || 0 : 0;
+  } catch (error) {
+    console.error('Error getting counter:', error);
+    return 0;
+  }
+}
+
+async function updateUserStats(userId, stats) {
+  try {
+    const userStatsRef = db.collection('users').doc(userId).collection('stats').doc('summary');
+    await userStatsRef.set({
+      ...stats,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (error) {
+    console.error('Error updating user stats:', error);
+  }
 }
 
 // ============================================================
@@ -8780,8 +9563,6 @@ window.validateUsername = validateUsername;
 window.openSearchScreen = openSearchScreen;
 window.closeSearchScreen = closeSearchScreen;
 window.handleSearch = handleSearch;
-
-// Settings functions
 window.renderSettingsPage = renderSettingsPage;
 window.toggleNotification = toggleNotification;
 window.toggleAutoPlay = toggleAutoPlay;
@@ -8791,15 +9572,11 @@ window.showHelp = showHelp;
 window.reportProblem = reportProblem;
 window.sendFeedback = sendFeedback;
 window.viewPrivacy = viewPrivacy;
-
-// Feedback functions
 window.submitFeedback = submitFeedback;
 window.loadAdminFeedback = loadAdminFeedback;
 window.markFeedbackRead = markFeedbackRead;
 window.markFeedbackResolved = markFeedbackResolved;
 window.deleteFeedback = deleteFeedback;
-
-// Housemate functions
 window.addHousemate = addHousemate;
 window.deleteHousemate = deleteHousemate;
 window.openHousemateDetail = openHousemateDetail;
@@ -8807,15 +9584,11 @@ window.closeHousemateDetail = closeHousemateDetail;
 window.submitAdminHousemate = submitAdminHousemate;
 window.previewAdminHousemateImage = previewAdminHousemateImage;
 window.toggleHousemateStatus = toggleHousemateStatus;
-
-// Prediction functions
 window.submitPrediction = submitPrediction;
 window.submitAdminPrediction = submitAdminPrediction;
 window.setAdminCorrectAnswer = setAdminCorrectAnswer;
 window.viewPredictionUsers = viewPredictionUsers;
 window.closePredictionUsersModal = closePredictionUsersModal;
-
-// Ad functions
 window.openAdsScreen = openAdsScreen;
 window.closeAdsScreen = closeAdsScreen;
 window.openAdDetail = openAdDetail;
@@ -8833,13 +9606,11 @@ window.verifyAdPayment = verifyAdPayment;
 window.showPaymentModal = showPaymentModal;
 window.closePaymentModal = closePaymentModal;
 window.copyUniqueCode = copyUniqueCode;
+window.loadMoreCommunityPosts = loadMoreCommunityPosts;
+window.loadMoreFeedPosts = loadMoreFeedPosts;
+window.refreshAllData = refreshAllData;
 
 console.log('🏠 DHouse app loaded with Firestore!');
 console.log('✅ All features loaded successfully!');
-console.log('🏠 Housemate management system loaded!');
-console.log('🏆 Prediction system loaded!');
-console.log('📢 Ad system loaded with payment flow!');
-console.log('⚙️ Settings screen loaded!');
-console.log('🔍 Search fixed with debounce!');
-console.log('📤 R2 image upload system loaded!');
+console.log('✅ Optimized data loading with caching enabled!');
 console.log('🚀 Ready for production!');

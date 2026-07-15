@@ -8,34 +8,49 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>DHouse</title>
     <link rel="stylesheet" href="style.css">
-    <!-- Add after <title> -->
-<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
-<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
-<link rel="apple-touch-icon" href="icon-192.png">
+    
+    <!-- PWA Icons -->
+    <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+    <link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    
+    <!-- Preload Critical Assets -->
+    <link rel="preconnect" href="https://www.gstatic.com">
+    <link rel="preconnect" href="https://the-house-app-23225.firebaseio.com">
+    <link rel="preconnect" href="https://dhouse-api.aplusbuddyhelp.workers.dev">
+    <link rel="preload" href="style.css" as="style">
+    <link rel="preload" href="app.js" as="script">
+    
+    <!-- DNS Prefetch -->
+    <link rel="dns-prefetch" href="https://www.gstatic.com">
+    <link rel="dns-prefetch" href="https://the-house-app-23225.firebaseio.com">
+    <link rel="dns-prefetch" href="https://dhouse-api.aplusbuddyhelp.workers.dev">
 
     <!-- Firebase CDN -->
     <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-analytics-compat.js"></script>
     
-<!-- ADD THIS LINE -->
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-analytics-compat.js"></script>
+    <!-- Sentry SDK -->
+    <script src="https://browser.sentry-cdn.com/7.120.0/bundle.min.js"></script>
 </head>
 <body>
     <!-- Network Status Indicator -->
-<div id="networkStatus" style="
-  display: none;
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 99999;
-  padding: 8px 16px;
-  text-align: center;
-  font-size: 14px;
-  font-weight: 600;
-  transition: all 0.3s ease;
-"></div>
+    <div id="networkStatus" style="
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 99999;
+        padding: 8px 16px;
+        text-align: center;
+        font-size: 14px;
+        font-weight: 600;
+        transition: all 0.3s ease;
+    "></div>
+    
     <div id="app"></div>
 
     <!-- ===== NEW POST MODAL ===== -->
@@ -61,7 +76,6 @@
                     </div>
                     <div class="upload-progress-bar">
                         <div class="upload-progress-fill" id="uploadProgressFill" style="width:0%;"></div>
-                        
                     </div>
                     <div id="uploadStatusText" style="color:#a7a9be;font-size:0.8rem;text-align:center;margin-top:0.3rem;"></div>
                 </div>
@@ -122,40 +136,42 @@
             <button class="close-emoji-picker" onclick="closeEmojiPicker()">Cancel</button>
         </div>
     </div>
-<!-- ===== CREATE AD MODAL ===== -->
-<div id="createAdModal" class="new-post-modal" style="display:none;">
-    <div class="new-post-modal-content">
-        <div class="new-post-modal-header">
-            <span style="font-size:1.2rem;font-weight:600;color:#fffffe;">📢 Create Ad</span>
-            <button class="close-modal-btn" onclick="closeCreateAdModal()">✕</button>
-        </div>
-        <div class="new-post-modal-body">
-            <div style="margin-bottom:1rem;">
-                <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Business Name *</label>
-                <input type="text" id="adBusinessNameInput" style="width:100%;padding:0.6rem;background:#0f0e17;border:1px solid #2a2a4e;border-radius:10px;color:#fffffe;font-size:0.9rem;" placeholder="Your business name">
+
+    <!-- ===== CREATE AD MODAL ===== -->
+    <div id="createAdModal" class="new-post-modal" style="display:none;">
+        <div class="new-post-modal-content">
+            <div class="new-post-modal-header">
+                <span style="font-size:1.2rem;font-weight:600;color:#fffffe;">📢 Create Ad</span>
+                <button class="close-modal-btn" onclick="closeCreateAdModal()">✕</button>
             </div>
-            
-            <div style="margin-bottom:1rem;">
-                <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Budget (₦) *</label>
-                <input type="number" id="adBudgetInput" style="width:100%;padding:0.6rem;background:#0f0e17;border:1px solid #2a2a4e;border-radius:10px;color:#fffffe;font-size:0.9rem;" placeholder="Enter amount" oninput="updateAdImpressionCount()">
-                <div style="background:#0f0e17;border-radius:10px;padding:0.8rem;margin-top:0.5rem;text-align:center;">
-                    <div style="color:#FFB300;font-size:1.5rem;font-weight:bold;" id="adImpressionDisplay">0</div>
-                    <div style="color:#6b7280;font-size:0.7rem;">Estimated Impressions</div>
-                    <div style="color:#6b7280;font-size:0.6rem;">Cost: ₦0.50 per impression</div>
+            <div class="new-post-modal-body">
+                <div style="margin-bottom:1rem;">
+                    <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Business Name *</label>
+                    <input type="text" id="adBusinessNameInput" style="width:100%;padding:0.6rem;background:#0f0e17;border:1px solid #2a2a4e;border-radius:10px;color:#fffffe;font-size:0.9rem;" placeholder="Your business name">
                 </div>
+                
+                <div style="margin-bottom:1rem;">
+                    <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Budget (₦) *</label>
+                    <input type="number" id="adBudgetInput" style="width:100%;padding:0.6rem;background:#0f0e17;border:1px solid #2a2a4e;border-radius:10px;color:#fffffe;font-size:0.9rem;" placeholder="Enter amount" oninput="updateAdImpressionCount()">
+                    <div style="background:#0f0e17;border-radius:10px;padding:0.8rem;margin-top:0.5rem;text-align:center;">
+                        <div style="color:#FFB300;font-size:1.5rem;font-weight:bold;" id="adImpressionDisplay">0</div>
+                        <div style="color:#6b7280;font-size:0.7rem;">Estimated Impressions</div>
+                        <div style="color:#6b7280;font-size:0.6rem;">Cost: ₦0.50 per impression</div>
+                    </div>
+                </div>
+                
+                <div style="margin-bottom:1rem;">
+                    <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Banner Image *</label>
+                    <input type="file" id="adImageInput" accept="image/*" style="display:none;" onchange="previewAdImage(event)">
+                    <button onclick="document.getElementById('adImageInput').click()" style="width:100%;padding:0.6rem;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:10px;color:#a7a9be;cursor:pointer;font-size:0.9rem;">📷 Select Image</button>
+                    <div id="adImagePreviewContainer" style="margin-top:0.5rem;"></div>
+                </div>
+                
+                <button id="submitAdBtn" onclick="submitAdRequest()" style="width:100%;padding:0.8rem;background:#e94560;border:none;border-radius:10px;color:white;font-weight:600;cursor:pointer;font-size:1rem;">💰 Submit Ad</button>
             </div>
-            
-            <div style="margin-bottom:1rem;">
-                <label style="color:#a7a9be;font-size:0.9rem;display:block;margin-bottom:0.3rem;">Banner Image *</label>
-                <input type="file" id="adImageInput" accept="image/*" style="display:none;" onchange="previewAdImage(event)">
-                <button onclick="document.getElementById('adImageInput').click()" style="width:100%;padding:0.6rem;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:10px;color:#a7a9be;cursor:pointer;font-size:0.9rem;">📷 Select Image</button>
-                <div id="adImagePreviewContainer" style="margin-top:0.5rem;"></div>
-            </div>
-            
-            <button id="submitAdBtn" onclick="submitAdRequest()" style="width:100%;padding:0.8rem;background:#e94560;border:none;border-radius:10px;color:white;font-weight:600;cursor:pointer;font-size:1rem;">💰 Submit Ad</button>
         </div>
     </div>
-</div>
+
     <script src="app.js"></script>
 </body>
 </html>

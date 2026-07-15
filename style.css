@@ -2264,3 +2264,47 @@ img.lazy-image.loaded {
 .post-card {
   contain: content;
 }
+
+/* ============================================================
+   ===== LOADING SKELETON =====
+   ============================================================ */
+.skeleton-post {
+    background: #1a1a2e;
+    border-radius: 16px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border: 1px solid #2a2a4e;
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+.skeleton-post .skeleton-avatar {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: #2a2a4e;
+}
+
+.skeleton-post .skeleton-line {
+    height: 12px;
+    background: #2a2a4e;
+    border-radius: 4px;
+    margin: 8px 0;
+}
+
+.skeleton-post .skeleton-line.short {
+    width: 60%;
+}
+
+.skeleton-post .skeleton-line.medium {
+    width: 80%;
+}
+
+.skeleton-post .skeleton-line.long {
+    width: 100%;
+}
+
+@keyframes pulse {
+    0% { opacity: 0.6; }
+    50% { opacity: 1; }
+    100% { opacity: 0.6; }
+}
